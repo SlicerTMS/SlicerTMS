@@ -6,3 +6,6 @@ bin/
 build/
 dist/
 lib/
+
+*~
+*.sw*
