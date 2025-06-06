@@ -7,6 +7,28 @@ exec(open("/media/share/tms-work/SlicerTMS/Experiments/onlinefem.py").read())
 
 """
 
+"""
+/Users/pieper/Applications/SimNIBS-4.5/bin/simnibs_python
+
+exec(open("/Users/pieper/slicer/latest/SlicerTMS/Experiments/onlinefem.py").read())
+
+
+
+/Users/pieper/Applications/SimNIBS-4.5/simnibs_env/bin/rpyc_classic
+
+import rpyc
+simnibs = rpyc.classic.connect("localhost", 18812)
+
+script = open("/Users/pieper/slicer/latest/SlicerTMS/Experiments/onlinefem.py").read()
+
+simnibs.execute(script)
+
+
+
+
+
+"""
+
 
 import os
 import pytest
