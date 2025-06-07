@@ -20,7 +20,6 @@ import rpyc
 simnibs = rpyc.classic.connect("localhost", 18812)
 
 script = open("/Users/pieper/slicer/latest/SlicerTMS/Experiments/onlinefem.py").read()
-
 simnibs.execute(script)
 
 
