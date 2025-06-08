@@ -77,19 +77,27 @@ center_points = m.elements_baricenters().value
 out_point = np.array((0, 0, 100))[None]
 center_points = np.concatenate((center_points, out_point), axis=0)
 point_cloud = onlinefem.FemTargetPointCloud(m, center_points, nearest_neighbor=nearest, fill_nearest=fill)
-            
+ 
 #prepare and setup OnlineFEM
 ofem = onlinefem.OnlineFEM(m, 'TMS', roi=[point_cloud], coil=coil, useElements=useElements, solver_options=solver_type, cond=cond)
-    
+
 #calculate vector E-field
 ofem.dataType = [1]
 #Solve the FEM
-E = ofem.update_field(matsimnibs=np.identity(4), didt=1e6)[0][0]        
-    
+E = ofem.update_field(matsimnibs=np.identity(4), didt=1e6)[0][0]
+
+def update_field(matlist):
+    mat = np.array(matlist)
+    E = ofem.update_field(matsimnibs=mat, didt=1e6)[0][0]
+    return E
+
+
+
+
 tests = """
 assert rdm(E[:-1,:], E_analytical) < .2
 assert np.abs(mag(E[:-1,:], E_analytical)) < np.log(1.1)
-    
+
 if fill:
     #find nearest point to the extra one outside
     nearest_idx = np.argmin(np.sqrt(((
