@@ -68,6 +68,7 @@ slicer.util.arrayFromModelCellDataModified(meshNode, "Enorm")
 #meshNode.GetDisplayNode().SetScalarVisibility(True)
 
 
+update_field = simnibs.eval("globals()")["update_field"]
 def animate():
     for i in range(300):
         coilPosition = numpy.identity(4)
@@ -76,12 +77,15 @@ def animate():
         #ofem = simnibs.eval("globals()")["ofem"]
         #E = ofem.update_field(matsimnibs=coilPosition.data, didt=1e6)[0][0]
 
-        update_field = simnibs.eval("globals()")["update_field"]
 
-        E = update_field(coilPosition.tolist())
+        E = numpy.frombuffer(update_field(coilPosition.tolist()))
 
         eArray = slicer.util.arrayFromModelCellData(meshNode, "Enorm")
+        E = E.reshape((eArray.shape[0]+1,3))
         eArray[:] = numpy.linalg.norm(numpy.array(E)[:-1], axis=1)
         slicer.util.arrayFromModelCellDataModified(meshNode, "Enorm")
         meshNode.GetDisplayNode().Modified()
         slicer.app.processEvents()
+        if i % 10 == 0:
+            print(i)
+            slicer.app.processEvents()

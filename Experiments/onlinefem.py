@@ -86,10 +86,14 @@ ofem.dataType = [1]
 #Solve the FEM
 E = ofem.update_field(matsimnibs=np.identity(4), didt=1e6)[0][0]
 
+test = """
+t = [ofem.update_field(matsimnibs=np.identity(4), didt=1e6 + 1e5*i)[0][0] for i in range(700)]
+"""
+
 def update_field(matlist):
     mat = np.array(matlist)
     E = ofem.update_field(matsimnibs=mat, didt=1e6)[0][0]
-    return E
+    return E.tobytes()
 
 
 
