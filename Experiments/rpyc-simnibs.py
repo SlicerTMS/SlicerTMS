@@ -2,10 +2,16 @@
 /Users/pieper/Applications/SimNIBS-4.5/bin/simnibs_python -m pip install rpyc
 """
 
-simnibs_python_path = "/Users/pieper/Applications/SimNIBS-4.5/bin/simnibs_python"
+onlinefemPath = "/Users/pieper/slicer/latest/SlicerTMS/Experiments/onlinefem.py"
+onlinefemPath = "/media/share/tms-work/SlicerTMS/Experiments/onlinefem.py"
+
+simnibs_pythonPath = "/Users/pieper/Applications/SimNIBS-4.5/bin/simnibs_python"
+simnibs_pythonPath = "/media/share/tms-work/SimNIBS/install/bin/simnibs_python"
 
 rpyc_path = "/Users/pieper/Applications/SimNIBS-4.5/simnibs_env/bin/rpyc_classic"
+rpyc_path = "/media/share/tms-work/SimNIBS/install/simnibs_env/bin/rpyc_classic"
 
+need_to_fix_pipe = """
 try:
     process
 except NameError:
@@ -17,6 +23,9 @@ process = slicer.util.launchConsoleProcess([rpyc_path], useStartupEnvironment=Tr
 
 line = process.stdout.readline().strip()
 port = int(line.split(":")[-1])
+"""
+
+port = 18812
 
 
 import numpy
@@ -24,8 +33,9 @@ import rpyc
 
 simnibs = rpyc.classic.connect("localhost", port)
 
-script = open("/Users/pieper/slicer/latest/SlicerTMS/Experiments/onlinefem.py").read()
+script = open(onlinefemPath).read()
 simnibs.execute(script)
+ofem = simnibs.eval("globals()")["ofem"]
 
 print("Simulation setup complete")
 slicer.app.processEvents()
@@ -67,10 +77,27 @@ slicer.util.arrayFromModelCellDataModified(meshNode, "Enorm")
 #meshNode.GetDisplayNode().SetActiveScalarName("Enorm")
 #meshNode.GetDisplayNode().SetScalarVisibility(True)
 
+probeNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode")
+probeNode.SetName("Probe")
+probeNode.CreateDefaultDisplayNodes()
+probeNode.GetDisplayNode().SetEditorVisibility(True)
+
+probeMatrix = vtk.vtkMatrix4x4()
+def updateEField(transformNode, event):
+    probeNode.GetMatrixTransformToParent(probeMatrix)
+    probeMatrixArray = slicer.util.arrayFromVTKMatrix(probeMatrix)
+    E = numpy.frombuffer(update_field(probeMatrixArray.tolist()))
+    eArray = slicer.util.arrayFromModelCellData(meshNode, "Enorm")
+    E = E.reshape((eArray.shape[0]+1,3))
+    eArray[:] = numpy.linalg.norm(numpy.array(E)[:-1], axis=1)
+    slicer.util.arrayFromModelCellDataModified(meshNode, "Enorm")
+    meshNode.GetDisplayNode().Modified()
+
+probeNode.AddObserver(slicer.vtkMRMLTransformNode.TransformModifiedEvent, updateEField)
 
 update_field = simnibs.eval("globals()")["update_field"]
-def animate():
-    for i in range(300):
+def animate(iterations=300):
+    for i in range(iterations):
         coilPosition = numpy.identity(4)
         coilPosition[0,3] = 2*i
 
