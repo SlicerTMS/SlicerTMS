@@ -1,4 +1,3 @@
-
 import numpy
 import time
 
@@ -15,18 +14,15 @@ simnibs_pythonPath = "/media/share/tms-work/SimNIBS/install/bin/simnibs_python"
 SimNIBSServicePath = "/Users/pieper/slicer/latest/SlicerTMS/Experiments/SimNIBSService.py"
 SimNIBSServicePath = "/media/share/tms-work/SlicerTMS/Experiments/SimNIBSService.py"
 
-
+slicer.mrmlScene.Clear()
 
 try:
-    process
+    process.kill()
 except NameError:
     pass
-else:
-    process.kill()
 
 cmdList = [simnibs_pythonPath, SimNIBSServicePath]
 process = slicer.util.launchConsoleProcess(cmdList, useStartupEnvironment=True)
-time.sleep(1)
 
 port = 18891
 
@@ -41,13 +37,14 @@ for attempt in range(10):
 		)
 		break
 	except ConnectionRefusedError:
+		print("waiting for server")
+		slicer.app.processEvents()
 		time.sleep(1)
 
 
 print("initialize_system")
 slicer.app.processEvents()
 simnibs.root.initialize_system()
-
 
 print("Simulation setup complete")
 slicer.app.processEvents()
@@ -79,12 +76,6 @@ meshNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
 meshNode.SetAndObserveMesh(meshGrid)
 meshNode.CreateDefaultDisplayNodes()
 
-
-# direct E
-eArray = slicer.util.arrayFromModelCellData(meshNode, "Enorm")
-eArray[:] = numpy.linalg.norm(numpy.array(simnibs.root.E)[:-1], axis=1)
-slicer.util.arrayFromModelCellDataModified(meshNode, "Enorm")
-
 probeMatrix = vtk.vtkMatrix4x4()
 def updateEField(transformNode, event):
     probeNode.GetMatrixTransformToParent(probeMatrix)
@@ -95,23 +86,15 @@ def updateEField(transformNode, event):
     slicer.util.arrayFromModelCellDataModified(meshNode, "Enorm")
     meshNode.GetDisplayNode().Modified()
 
-needed = """ ?
-eArray = slicer.util.arrayFromModelCellData(meshNode, "Enorm")
-probeMatrixArray = slicer.util.arrayFromVTKMatrix(probeMatrix)
-E = numpy.frombuffer(update_field(probeMatrixArray.tolist()))
-E = E.reshape((eArray.shape[0]+1,3))
-eArray[:] = numpy.linalg.norm(numpy.array(simnibs_eval("E"))[:-1], axis=1)
-slicer.util.arrayFromModelCellDataModified(meshNode, "Enorm")
-"""
-
-# this should be working, but if we call this the scalars don't show and can't be turned on manually
-#meshNode.GetDisplayNode().SetAndObserveColorNodeID('vtkMRMLColorTableNodeFileViridis.txt')
-#meshNode.GetDisplayNode().SetActiveScalarName("Enorm")
-#meshNode.GetDisplayNode().SetScalarVisibility(True)
-
 probeNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode")
 probeNode.SetName("Probe")
 probeNode.CreateDefaultDisplayNodes()
 probeNode.GetDisplayNode().SetEditorVisibility(True)
 
 probeNode.AddObserver(slicer.vtkMRMLTransformNode.TransformModifiedEvent, updateEField)
+probeNode.TransformModified()
+
+# this should be working, but if we call this the scalars don't show and can't be turned on manually
+meshNode.GetDisplayNode().SetAndObserveColorNodeID('vtkMRMLColorTableNodeFileViridis.txt')
+meshNode.GetDisplayNode().SetScalarVisibility(True)
+meshNode.GetDisplayNode().SetActiveScalar("Enorm", vtk.vtkAssignAttribute.CELL_DATA)
