@@ -1,3 +1,4 @@
+import multiprocessing.shared_memory
 import numpy
 import time
 
@@ -5,7 +6,7 @@ try:
 	import rpyc
 except ModuleNotFoundError:
 	import pip
-	pip.main("install rpyc")
+	pip.main("install rpyc".split())
 	import rpyc
 
 simnibs_pythonPath = "/Users/pieper/Applications/SimNIBS-4.5/bin/simnibs_python"
@@ -13,6 +14,10 @@ simnibs_pythonPath = "/media/share/tms-work/SimNIBS/install/bin/simnibs_python"
 
 SimNIBSServicePath = "/Users/pieper/slicer/latest/SlicerTMS/Experiments/SimNIBSService.py"
 SimNIBSServicePath = "/media/share/tms-work/SlicerTMS/Experiments/SimNIBSService.py"
+
+meshFileName = None # for sphere example
+meshFileName = '/media/share/tms-work/SimNIBS/data/m2m_MNI152/MNI152.msh'
+
 
 slicer.mrmlScene.Clear()
 
@@ -44,13 +49,23 @@ for attempt in range(10):
 
 print("initialize_system")
 slicer.app.processEvents()
-simnibs.root.initialize_system()
+simnibs.root.initialize_system(meshFileName)
 
 print("Simulation setup complete")
 slicer.app.processEvents()
 
 nodeCoords = numpy.array(simnibs.root.mesh.nodes.node_coord)
 elementIndices = numpy.array(simnibs.root.mesh.elm.node_number_list) - 1
+
+try:
+	sharedMemoryForE.close()
+	sharedMemoryForE.unlink()
+except (NameError, FileNotFoundError):
+	pass
+sharedEName = "sharedE"
+eSize = numpy.prod(simnibs.root.E.shape) * simnibs.root.E.dtype.itemsize
+sharedMemoryForE = multiprocessing.shared_memory.SharedMemory(create=True, size=eSize, name=sharedEName)
+sharedE = numpy.ndarray(simnibs.root.E.shape, dtype=simnibs.root.E.dtype.str, buffer=sharedMemoryForE.buf)
 
 meshGrid = vtk.vtkUnstructuredGrid()
 
@@ -82,7 +97,10 @@ def updateEField(transformNode, event):
     probeMatrixArray = slicer.util.arrayFromVTKMatrix(probeMatrix)
     simnibs.root.update_E_field(probeMatrixArray.tolist())
     eArray = slicer.util.arrayFromModelCellData(meshNode, "Enorm")
-    eArray[:] = numpy.linalg.norm(numpy.array(simnibs.root.E)[:-1], axis=1)
+    # E = simnibs.root.E ; slow
+    simnibs.root.copy_E_to_share(sharedEName)
+    E = sharedE
+    eArray[:] = numpy.linalg.norm(E[:-1], axis=1)
     slicer.util.arrayFromModelCellDataModified(meshNode, "Enorm")
     meshNode.GetDisplayNode().Modified()
 

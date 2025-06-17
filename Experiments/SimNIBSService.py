@@ -1,7 +1,7 @@
-
+import numpy as np
+import multiprocessing.shared_memory
 import os
 import pytest
-import numpy as np
 
 try:
 	import rpyc
@@ -20,6 +20,8 @@ from simnibs.simulation.onlinefem import OnlineFEM, FemTargetPointCloud
 
 
 class SimNIBSService(rpyc.SlaveService):
+	def __init__(self):
+		self.sharedE = None
 
 	def initialize_system(self, mesh_path=None, solver="mumps", cpus=None):
 		if not mesh_path:
@@ -59,7 +61,15 @@ class SimNIBSService(rpyc.SlaveService):
 		point_cloud = onlinefem.FemTargetPointCloud(self.mesh, center_points, nearest_neighbor=nearest, fill_nearest=fill)
 		 
 		print("prepare and setup OnlineFEM")
-		self.ofem = onlinefem.OnlineFEM(self.mesh, 'TMS', roi=[point_cloud], coil=coil, useElements=useElements, solver_options=solver, cond=cond, cpus=cpus)
+		self.ofem = onlinefem.OnlineFEM(
+				self.mesh,
+				'TMS',
+				roi=[point_cloud],
+				coil=coil,
+				useElements=useElements,
+				solver_options=solver,
+				cond=cond,
+				cpus=cpus)
 
 		#calculate vector E-field
 		self.ofem.dataType = [1]
@@ -67,10 +77,10 @@ class SimNIBSService(rpyc.SlaveService):
 		self.E = self.ofem.update_field(matsimnibs=np.identity(4), didt=1e6)[0][0]
 
 	def copy_E_to_share(self, share_name):
-		if not self.sharedE:
-			self.shared_memory_for_E = multiprocessing.shared_memory.SharedMemory(size=eSize, name=share_name)
-			sharedE = numpy.array(E.shape, E.dtype, buffer=sharedMemoryForE.buf)
-		sharedE[:] = self.E
+		if self.sharedE is None:
+			self.shared_memory_for_E = multiprocessing.shared_memory.SharedMemory(name=share_name)
+			self.sharedE = np.ndarray(self.E.shape, self.E.dtype, buffer=self.shared_memory_for_E.buf)
+		self.sharedE[:] = self.E
 
 	def update_E_field(self, probe_matrix_list):
 		mat = np.array(probe_matrix_list)
