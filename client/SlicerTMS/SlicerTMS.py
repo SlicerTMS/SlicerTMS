@@ -282,22 +282,29 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         except Exception:
             return False
 
+    _TMSWARP_GIT = "https://github.com/pieper/TMSWarp.git"
+
     @staticmethod
     def ensureDependencies():
-        """Install all packages the TMSService needs into Slicer's Python.
+        """Install TMSWarp and service dependencies into Slicer's Python.
 
-        Installs from TMSWarp/requirements.txt (numpy, scipy, warp-lang, rpyc)
-        then installs the tmswarp package itself from the local source tree.
-        This runs once before starting the service; the service subprocess
-        (PythonSlicer) will then have all imports available.
+        Installs/upgrades tmswarp from git so that a fresh machine only needs
+        the SlicerTMS repo — no manual TMSWarp checkout required.
+        Also installs warp-lang and rpyc which are needed by the service but
+        are not core tmswarp dependencies.
         """
-        req_path = os.path.join(_TMSWARP_ROOT, "requirements.txt")
-        if os.path.isfile(req_path):
-            slicer.util.pip_install(["-r", req_path])
+        # Always upgrade tmswarp from git to pick up latest changes.
+        # numpy and scipy come in automatically via tmswarp's pyproject.toml.
+        slicer.util.pip_install(
+            f"--upgrade git+{SlicerTMSLogic._TMSWARP_GIT}"
+        )
 
-        # Install tmswarp as a package so it is importable without sys.path edits
-        if os.path.isdir(_TMSWARP_ROOT):
-            slicer.util.pip_install(_TMSWARP_ROOT)
+        # warp-lang and rpyc are not in tmswarp's core deps
+        for pkg, mod in [("warp-lang", "warp"), ("rpyc", "rpyc")]:
+            try:
+                __import__(mod)
+            except ImportError:
+                slicer.util.pip_install(pkg)
 
     # ------------------------------------------------------------------
     # Mesh helpers
