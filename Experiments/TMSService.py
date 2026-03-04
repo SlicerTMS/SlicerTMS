@@ -34,12 +34,7 @@ import sys
 
 import numpy as np
 
-try:
-    import rpyc
-except ModuleNotFoundError:
-    import pip
-    pip.main(["install", "rpyc"])
-    import rpyc
+import rpyc
 
 # ---------------------------------------------------------------------------
 # Locate TMSWarp src/ so we can import tmswarp without a pip install
