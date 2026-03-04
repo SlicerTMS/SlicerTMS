@@ -275,12 +275,10 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
 
     @staticmethod
     def hasCudaGpu():
-        """Return True if nvidia-smi reports a CUDA device."""
+        """Return True if warp detects at least one CUDA device."""
         try:
-            subprocess.run(
-                ["nvidia-smi"], capture_output=True, timeout=3, check=True
-            )
-            return True
+            import warp as wp
+            return wp.is_cuda_available()
         except Exception:
             return False
 
@@ -288,25 +286,18 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
     def ensureDependencies():
         """Install all packages the TMSService needs into Slicer's Python.
 
-        This runs once (or whenever the user clicks 'Install / Check
-        Dependencies') and ensures that when the service is launched with
-        sys.executable (PythonSlicer) it can import everything it needs.
+        Installs from TMSWarp/requirements.txt (numpy, scipy, warp-lang, rpyc)
+        then installs the tmswarp package itself from the local source tree.
+        This runs once before starting the service; the service subprocess
+        (PythonSlicer) will then have all imports available.
         """
-        # (pkg_name, importable_name)
-        required = [
-            ("rpyc",      "rpyc"),
-            ("warp-lang", "warp"),
-        ]
-        for pkg, mod in required:
-            try:
-                __import__(mod)
-            except ImportError:
-                slicer.util.pip_install(pkg)
-                __import__(mod)
+        req_path = os.path.join(_TMSWARP_ROOT, "requirements.txt")
+        if os.path.isfile(req_path):
+            slicer.util.pip_install(["-r", req_path])
 
-        # Make tmswarp importable (local src/ install — no pip package needed)
-        if _TMSWARP_SRC not in sys.path and os.path.isdir(_TMSWARP_SRC):
-            sys.path.insert(0, _TMSWARP_SRC)
+        # Install tmswarp as a package so it is importable without sys.path edits
+        if os.path.isdir(_TMSWARP_ROOT):
+            slicer.util.pip_install(_TMSWARP_ROOT)
 
     # ------------------------------------------------------------------
     # Mesh helpers
