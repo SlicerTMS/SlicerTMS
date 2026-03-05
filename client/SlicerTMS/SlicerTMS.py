@@ -33,8 +33,24 @@ _LOG_DIR       = os.path.join(_TEST_CACHE, "logs")
 # Fix for PythonSlicer: sys._base_executable is '' in the embedded interpreter,
 # which causes multiprocessing.resource_tracker to exec an empty path and die.
 # Setting the spawn executable to sys.executable lets SharedMemory work normally.
-if not multiprocessing.spawn.get_executable():
-    multiprocessing.spawn.set_executable(sys.executable)
+# NOTE: This must NOT run at module load time — Slicer sets sys.executable AFTER
+# loading scripted modules, so it would be empty.  Call _fix_spawn_executable()
+# before the first SharedMemory use instead.
+_spawn_exe_fixed = False
+
+def _fix_spawn_executable():
+    global _spawn_exe_fixed
+    if _spawn_exe_fixed:
+        return
+    _spawn_exe_fixed = True
+    if not multiprocessing.spawn.get_executable() or \
+       multiprocessing.spawn.get_executable() == b'':
+        exe = sys.executable
+        if exe:
+            multiprocessing.spawn.set_executable(exe)
+            logging.getLogger("SlicerTMS").info(
+                f"Fixed multiprocessing spawn executable: {exe}"
+            )
 
 # ---------------------------------------------------------------------------
 # Session logging — keeps the last 10 session logs
@@ -166,6 +182,7 @@ def _kill_processes_on_port(port):
 
 def _cleanup_orphaned_shm(name):
     """Try to unlink an orphaned POSIX shared-memory segment with *name*."""
+    _fix_spawn_executable()
     try:
         shm = multiprocessing.shared_memory.SharedMemory(name=name, create=False)
         shm.close()
@@ -1079,6 +1096,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
                  else "setupVisualization: mesh node ready")
 
         # Shared memory for fast E-field streaming (avoids RPyC serialisation)
+        _fix_spawn_executable()
         self._cleanupSharedMemory()
         _cleanup_orphaned_shm(self._shmName)
         log.info(f"setupVisualization: creating shared memory '{self._shmName}', "
