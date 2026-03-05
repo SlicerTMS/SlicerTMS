@@ -25,6 +25,7 @@ _TMSWARP_SRC  = os.path.join(_TMSWARP_ROOT, "src")
 
 DEFAULT_PORT   = 18892
 _SHARED_E_NAME = "tmsSharedE"
+_TEST_CACHE    = os.path.join(os.path.expanduser("~"), ".cache", "SlicerTMS")
 
 
 # ============================================================
@@ -85,13 +86,11 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
         meshRow.addWidget(dlBtn)
         svcForm.addRow("Mesh (.npz):", meshRow)
 
-        # Solver combo — detect GPU and set as default if available
+        # Solver combo — availability updated after creation
         self.solverCombo = qt.QComboBox()
-        self.solverCombo.addItem("NumPy  —  pre-factorized LU,  CPU",    "numpy")
-        self.solverCombo.addItem("Warp   —  CG iterative,       CPU",    "warp_cpu")
-        self.solverCombo.addItem("Warp   —  CG iterative,       GPU / CUDA", "warp_gpu")
-        defaultSolverIdx = 2 if self.logic.hasCudaGpu() else 0
-        self.solverCombo.setCurrentIndex(defaultSolverIdx)
+        self.solverCombo.addItem("NumPy  —  pre-factorized LU,  CPU",       "numpy")
+        self.solverCombo.addItem("Warp   —  CG iterative,       CPU",       "warp_cpu")
+        self.solverCombo.addItem("Warp   —  CG iterative,       GPU / CUDA","warp_gpu")
         svcForm.addRow("Solver:", self.solverCombo)
 
         # Start / Stop
@@ -149,10 +148,9 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
         # Live solver switching
         switchRow = qt.QHBoxLayout()
         self.liveSolverCombo = qt.QComboBox()
-        self.liveSolverCombo.addItem("NumPy  —  pre-factorized LU,  CPU",    "numpy")
-        self.liveSolverCombo.addItem("Warp   —  CG iterative,       CPU",    "warp_cpu")
-        self.liveSolverCombo.addItem("Warp   —  CG iterative,       GPU / CUDA", "warp_gpu")
-        self.liveSolverCombo.setCurrentIndex(defaultSolverIdx)
+        self.liveSolverCombo.addItem("NumPy  —  pre-factorized LU,  CPU",       "numpy")
+        self.liveSolverCombo.addItem("Warp   —  CG iterative,       CPU",       "warp_cpu")
+        self.liveSolverCombo.addItem("Warp   —  CG iterative,       GPU / CUDA","warp_gpu")
         switchRow.addWidget(self.liveSolverCombo)
         switchBtn = qt.QPushButton("Switch")
         switchBtn.setFixedWidth(55)
@@ -166,8 +164,9 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
 
         self.layout.addStretch(1)
 
-        # Auto-detect mesh on startup
+        # Auto-detect mesh and set solver availability on startup
         self._autoDetectMesh()
+        self._updateSolverAvailability()
 
     def cleanup(self):
         if self.logic:
@@ -199,10 +198,43 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
             self._setStatus(f"Download failed: {exc}")
             slicer.util.errorDisplay(str(exc))
 
+    def _updateSolverAvailability(self):
+        """Gray out solver options that are not currently usable."""
+        warp_ok = False
+        cuda_ok = False
+        try:
+            import warp as wp
+            warp_ok = True
+            cuda_ok = wp.is_cuda_available()
+        except Exception:
+            pass
+
+        available = {"numpy": True, "warp_cpu": warp_ok, "warp_gpu": cuda_ok}
+        tips = {
+            "numpy":    "Pre-factorized LU direct solver — always available",
+            "warp_cpu": "Warp CG on CPU — requires warp-lang (click Install Dependencies)",
+            "warp_gpu": "Warp CG on GPU — requires CUDA GPU + warp-lang",
+        }
+
+        for combo in (self.solverCombo, self.liveSolverCombo):
+            for i in range(combo.count):
+                solver = combo.itemData(i)
+                item   = combo.model().item(i)
+                item.setEnabled(available.get(solver, False))
+                item.setToolTip(tips.get(solver, ""))
+
+            # Select best available: GPU > numpy > warp_cpu
+            order = [2, 0, 1] if cuda_ok else [0, 1, 2]
+            for idx in order:
+                if available.get(combo.itemData(idx), False):
+                    combo.setCurrentIndex(idx)
+                    break
+
     def _installDependencies(self):
         self._setStatus("Installing dependencies …")
         try:
             self.logic.ensureDependencies()
+            self._updateSolverAvailability()
             self._setStatus("Dependencies OK")
         except Exception as exc:
             self._setStatus(f"Error: {exc}")
@@ -214,6 +246,7 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
         try:
             self._setStatus("Installing dependencies …")
             self.logic.ensureDependencies()
+            self._updateSolverAvailability()
             self._setStatus("Starting TMSService …")
             self.logic.startService(meshPath, solver, DEFAULT_PORT)
             self._setStatus("Connecting …")
@@ -551,97 +584,100 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
 # ============================================================
 
 class SlicerTMSTest(ScriptedLoadableModuleTest):
-    """Self-test: check dependencies, ernie availability, and FEM service.
-
-    The FEM service test uses sphere3_data.npz (small synthetic mesh, fast)
-    so the test completes in under a minute.  Ernie availability is checked
-    but not required for the test to pass.
+    """Self-test: fully automatic — installs dependencies, generates test mesh,
+    starts TMSService, runs FEM, verifies E-field.  No manual steps required.
     """
 
     def runTest(self):
         self.setUp()
         self.test_1_dependencies()
-        self.test_2_mesh_availability()
+        self.test_2_prepare_mesh()
         self.test_3_service_and_fem()
 
     def setUp(self):
         slicer.mrmlScene.Clear()
+        os.makedirs(_TEST_CACHE, exist_ok=True)
 
     # ------------------------------------------------------------------
 
     def test_1_dependencies(self):
-        self.delayDisplay("Step 1 — checking / installing dependencies …")
-        logic = SlicerTMSLogic()
-        logic.ensureDependencies()
-        import rpyc  # noqa: F401 — must not raise
-        self.delayDisplay("  rpyc available ✓")
+        self.delayDisplay("Step 1 — installing / verifying dependencies …")
+        SlicerTMSLogic().ensureDependencies()
+        import rpyc    # noqa: F401
+        import tmswarp # noqa: F401
+        self.delayDisplay("  Dependencies OK ✓")
 
-    def test_2_mesh_availability(self):
-        self.delayDisplay("Step 2 — checking mesh files …")
-        sphere3 = os.path.join(_TMSWARP_ROOT, "sphere3_data.npz")
-        ernie   = os.path.join(_TMSWARP_ROOT, "ernie_data.npz")
+    def test_2_prepare_mesh(self):
+        """Generate sphere3 test mesh if not already cached."""
+        self.delayDisplay("Step 2 — preparing test mesh …")
 
-        if not os.path.isfile(sphere3):
-            raise Exception(
-                f"sphere3_data.npz not found at {sphere3}.\n"
-                "Run TMSWarp tests first:  cd TMSWarp && pixi run pytest"
-            )
-        self.delayDisplay(f"  sphere3_data.npz ✓  ({os.path.getsize(sphere3)//1024} KB)")
+        # Prefer the local checkout if it already has the file
+        local = os.path.join(_TMSWARP_ROOT, "sphere3_data.npz")
+        cached = os.path.join(_TEST_CACHE, "sphere3_data.npz")
 
-        if os.path.isfile(ernie):
-            self.delayDisplay(
-                f"  ernie_data.npz  ✓  ({os.path.getsize(ernie)//1024//1024} MB)"
-            )
-        else:
-            self.delayDisplay(
-                "  ernie_data.npz  — not found (optional).\n"
-                "  To generate: run TMSWarp/scripts/fetch_ernie.py with SimNIBS Python.\n"
-                "  Download URL: https://github.com/simnibs/example-dataset/"
-                "releases/download/v4.0-lowres/ernie_lowres_V2.zip"
-            )
+        if os.path.isfile(local):
+            self._sphere3Path = local
+            self.delayDisplay(f"  Using local sphere3_data.npz ({os.path.getsize(local)//1024} KB) ✓")
+            return
+
+        if os.path.isfile(cached):
+            self._sphere3Path = cached
+            self.delayDisplay(f"  Using cached sphere3_data.npz ({os.path.getsize(cached)//1024} KB) ✓")
+            return
+
+        self.delayDisplay("  Generating sphere3 mesh (takes ~5 s) …")
+        from tmswarp.conductor import make_sphere_mesh
+        mesh = make_sphere_mesh(radius=0.09, n_shells=5, n_surface=200, conductivity=0.33)
+        numpy.savez(cached,
+                    nodes=mesh.nodes,
+                    elements=mesh.elements,
+                    conductivity=mesh.conductivity)
+        self._sphere3Path = cached
+        self.delayDisplay(
+            f"  Generated sphere3: {mesh.nodes.shape[0]:,} nodes, "
+            f"{mesh.elements.shape[0]:,} elements ✓"
+        )
 
     def test_3_service_and_fem(self):
-        self.delayDisplay("Step 3 — starting TMSService with sphere3 mesh …")
+        self.delayDisplay("Step 3 — starting TMSService and running FEM …")
         logic = SlicerTMSLogic()
-        sphere3 = os.path.join(_TMSWARP_ROOT, "sphere3_data.npz")
-        port    = DEFAULT_PORT + 1   # avoid colliding with a running session
+        port  = DEFAULT_PORT + 1    # avoid colliding with a running session
 
         try:
-            logic.ensureDependencies()
-            logic.startService(sphere3, "numpy", port)
-            self.delayDisplay("  Service process started, connecting …")
+            logic.startService(self._sphere3Path, "numpy", port)
+            self.delayDisplay("  Service started, connecting …")
             logic.connectToService(port)
             self.delayDisplay("  Connected.  Initializing FEM …")
-            logic.initializeFEM(sphere3, "numpy")
+            logic.initializeFEM(self._sphere3Path, "numpy")
 
-            E = numpy.array(logic._tms.root.E)
-            self.assertIsNotNone(E, "E-field is None")
-            self.assertEqual(E.ndim, 2, f"E.ndim expected 2, got {E.ndim}")
-            self.assertEqual(E.shape[1], 3, f"E.shape[1] expected 3, got {E.shape[1]}")
+            E    = numpy.array(logic._tms.root.E)
             Emag = numpy.linalg.norm(E, axis=1)
+            self.assertEqual(E.ndim,    2, f"E.ndim={E.ndim}, expected 2")
+            self.assertEqual(E.shape[1],3, f"E.shape[1]={E.shape[1]}, expected 3")
             self.assertGreater(Emag.max(), 0, "E-field magnitude is zero")
-
             self.delayDisplay(
-                f"  FEM result: {E.shape[0]} elements, "
-                f"|E|_max = {Emag.max():.3f} V/m  ✓"
+                f"  FEM OK: {E.shape[0]:,} elements, |E|_max = {Emag.max():.3f} V/m ✓"
             )
 
-            # Quick ernie smoke test if the mesh is present
+            # Ernie smoke test — only if the .npz is already present locally
             ernie = os.path.join(_TMSWARP_ROOT, "ernie_data.npz")
             if os.path.isfile(ernie):
                 self.delayDisplay(
-                    "  ernie_data.npz found — verifying service can load it "
-                    "(this may take several minutes) …"
+                    f"  ernie_data.npz found ({os.path.getsize(ernie)//1024//1024} MB) — "
+                    "running FEM (numpy pre-factorization may take several minutes) …"
                 )
                 logic.initializeFEM(ernie, "numpy")
-                E_ernie = numpy.array(logic._tms.root.E)
-                self.assertGreater(
-                    numpy.linalg.norm(E_ernie, axis=1).max(), 0,
-                    "Ernie E-field magnitude is zero"
-                )
+                E_e    = numpy.array(logic._tms.root.E)
+                Emag_e = numpy.linalg.norm(E_e, axis=1)
+                self.assertGreater(Emag_e.max(), 0, "Ernie E-field is zero")
                 self.delayDisplay(
-                    f"  Ernie FEM result: {E_ernie.shape[0]} elements, "
-                    f"|E|_max = {numpy.linalg.norm(E_ernie, axis=1).max():.3f} V/m  ✓"
+                    f"  Ernie FEM OK: {E_e.shape[0]:,} elements, "
+                    f"|E|_max = {Emag_e.max():.3f} V/m ✓"
+                )
+            else:
+                self.delayDisplay(
+                    "  ernie_data.npz not present — skipping ernie test.\n"
+                    "  (Generate it with TMSWarp/scripts/fetch_ernie.py using SimNIBS Python.)"
                 )
 
         finally:
