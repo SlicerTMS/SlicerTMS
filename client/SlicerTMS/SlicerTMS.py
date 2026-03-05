@@ -4,8 +4,10 @@ Connects to TMSService.py (RPyC) running as a PythonSlicer subprocess.
 Move the 'TMS Probe' linear transform to update the E-field in real time.
 """
 
+import logging
 import multiprocessing.shared_memory
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -24,8 +26,103 @@ _TMSWARP_ROOT = os.path.join(_REPO_ROOT, "TMSWarp")
 _TMSWARP_SRC  = os.path.join(_TMSWARP_ROOT, "src")
 
 DEFAULT_PORT   = 18892
-_SHARED_E_NAME = "tmsSharedE"
 _TEST_CACHE    = os.path.join(os.path.expanduser("~"), ".cache", "SlicerTMS")
+
+# QProcess enum → human-readable name (pattern from SlicerParallelProcessing)
+_QProcessStateNames = {
+    qt.QProcess.NotRunning: "NotRunning",
+    qt.QProcess.Starting:   "Starting",
+    qt.QProcess.Running:    "Running",
+}
+_QProcessErrorNames = {
+    qt.QProcess.FailedToStart: "FailedToStart",
+    qt.QProcess.Crashed:       "Crashed",
+    qt.QProcess.Timedout:      "Timedout",
+    qt.QProcess.WriteError:    "WriteError",
+    qt.QProcess.ReadError:     "ReadError",
+    qt.QProcess.UnknownError:  "UnknownError",
+}
+
+
+def _kill_processes_on_port(port):
+    """Find and kill any processes listening on *port* (zombie cleanup).
+
+    Tries multiple tools in order of reliability:
+      1. ``fuser`` (Linux) — directly reports PIDs on a TCP port
+      2. ``lsof`` (macOS/Linux) — ``-ti :PORT`` for terse PID output
+      3. ``pgrep`` — matches TMSService command lines with ``--port PORT``
+    """
+    pids = set()
+    my_pid = os.getpid()
+
+    # --- fuser (Linux) ---
+    try:
+        result = subprocess.run(
+            ["fuser", f"{port}/tcp"],
+            capture_output=True, text=True, timeout=5,
+        )
+        # fuser writes PIDs to stderr
+        for tok in (result.stdout + " " + result.stderr).split():
+            tok = tok.strip().rstrip("e")  # fuser may append 'e' for established
+            if tok.isdigit():
+                pids.add(int(tok))
+    except (FileNotFoundError, Exception):
+        pass
+
+    # --- lsof (macOS, some Linux) ---
+    if not pids:
+        try:
+            result = subprocess.run(
+                ["lsof", "-ti", f":{port}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for tok in result.stdout.split():
+                if tok.strip().isdigit():
+                    pids.add(int(tok))
+        except (FileNotFoundError, Exception):
+            pass
+
+    # --- pgrep fallback (matches TMSService command line) ---
+    if not pids:
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", f"TMSService.*--port {port}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for tok in result.stdout.split():
+                if tok.strip().isdigit():
+                    pids.add(int(tok))
+        except (FileNotFoundError, Exception):
+            pass
+
+    killed = []
+    for pid in pids:
+        if pid == my_pid:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed.append(pid)
+            logging.info(f"[SlicerTMS] Killed zombie process {pid} on port {port}")
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            logging.warning(
+                f"[SlicerTMS] No permission to kill PID {pid} on port {port}"
+            )
+    return killed
+
+
+def _cleanup_orphaned_shm(name):
+    """Try to unlink an orphaned POSIX shared-memory segment with *name*."""
+    try:
+        shm = multiprocessing.shared_memory.SharedMemory(name=name, create=False)
+        shm.close()
+        shm.unlink()
+        logging.info(f"[SlicerTMS] Cleaned up orphaned shared memory '{name}'")
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logging.warning(f"[SlicerTMS] Could not clean shared memory '{name}': {exc}")
 
 
 # ============================================================
@@ -179,7 +276,10 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
 
     def cleanup(self):
         if self.logic:
-            self.logic.stopService()
+            try:
+                self.logic.stopService()
+            except Exception:
+                pass  # best-effort during Slicer shutdown
 
     # ------------------------------------------------------------------
     # Slot helpers
@@ -335,14 +435,21 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
 class SlicerTMSLogic(ScriptedLoadableModuleLogic):
     def __init__(self):
         ScriptedLoadableModuleLogic.__init__(self)
-        self._process      = None   # subprocess handle for TMSService
+        self._process      = None   # qt.QProcess for TMSService
         self._tms          = None   # RPyC connection
         self._shm          = None   # shared memory block
         self._sharedE      = None   # numpy view into shared memory
+        self._shmName      = f"tmsSharedE_{os.getpid()}_{id(self):x}"
+        self._port         = None   # port used by current service
         self._meshNode     = None   # vtkMRMLModelNode for E-field display
         self._probeNode    = None   # vtkMRMLLinearTransformNode
         self._probeObsTag  = None   # observer tag
         self._probeMatrix  = vtk.vtkMatrix4x4()
+        # QProcess signal slots (stored to prevent GC)
+        self._onStateChangedSlot = None
+        self._onReadyReadOutSlot = None
+        self._onReadyReadErrSlot = None
+        self._onFinishedSlot     = None
 
     # ------------------------------------------------------------------
     # Dependency / environment helpers
@@ -530,26 +637,155 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
     # ------------------------------------------------------------------
 
     def startService(self, meshPath, solver, port):
-        """Launch TMSService.py as a PythonSlicer subprocess."""
+        """Launch TMSService.py as a QProcess subprocess.
+
+        Kills zombie processes on the port and cleans orphaned shared
+        memory before launching.
+        """
         if self._process is not None:
             self.stopService()
         if not os.path.isfile(_SERVICE_PATH):
             raise FileNotFoundError(
                 f"TMSService.py not found at {_SERVICE_PATH}"
             )
-        cmdList = [
-            sys.executable, _SERVICE_PATH,
-            "--solver", solver,
-            "--port",   str(port),
-        ]
-        self._process = slicer.util.launchConsoleProcess(
-            cmdList, useStartupEnvironment=False
+
+        self._port = port
+
+        # Zombie cleanup
+        killed = _kill_processes_on_port(port)
+        if killed:
+            logging.info(
+                f"[SlicerTMS] Killed {len(killed)} zombie(s) on port {port}: {killed}"
+            )
+            time.sleep(1.0)  # OS needs time to release the port after SIGKILL
+
+        # Orphaned shared-memory cleanup
+        _cleanup_orphaned_shm(self._shmName)
+
+        # Create QProcess and wire signals (SlicerParallelProcessing pattern)
+        self._process = qt.QProcess()
+
+        self._onStateChangedSlot = self._onProcessStateChanged
+        self._process.connect(
+            'stateChanged(QProcess::ProcessState)', self._onStateChangedSlot
         )
 
+        self._onReadyReadOutSlot = self._onReadyReadStdout
+        self._process.connect(
+            'readyReadStandardOutput()', self._onReadyReadOutSlot
+        )
+
+        self._onReadyReadErrSlot = self._onReadyReadStderr
+        self._process.connect(
+            'readyReadStandardError()', self._onReadyReadErrSlot
+        )
+
+        self._onFinishedSlot = lambda exitCode, exitStatus: (
+            self._onProcessFinished(exitCode, exitStatus)
+        )
+        self._process.connect(
+            'finished(int,QProcess::ExitStatus)', self._onFinishedSlot
+        )
+
+        # Launch
+        self._process.start(sys.executable, [
+            _SERVICE_PATH,
+            "--solver", solver,
+            "--port",   str(port),
+        ])
+
+        if not self._process.waitForStarted(5000):
+            error = _QProcessErrorNames.get(self._process.error(), "Unknown")
+            raise RuntimeError(f"TMSService QProcess failed to start: {error}")
+
+    # ------------------------------------------------------------------
+    # QProcess signal handlers
+    # ------------------------------------------------------------------
+
+    def _onProcessStateChanged(self, newState):
+        name = _QProcessStateNames.get(newState, f"Unknown({newState})")
+        logging.info(f"[SlicerTMS] TMSService state: {name}")
+        if self._process and self._process.error() != qt.QProcess.UnknownError:
+            err = _QProcessErrorNames.get(self._process.error(), "?")
+            logging.warning(f"[SlicerTMS] TMSService error: {err}")
+
+    def _onReadyReadStdout(self):
+        if self._process is None:
+            return
+        data = self._process.readAllStandardOutput()
+        if data:
+            for line in data.data().decode("utf-8", errors="replace").rstrip("\n").split("\n"):
+                logging.info(f"[TMSService] {line}")
+
+    def _onReadyReadStderr(self):
+        if self._process is None:
+            return
+        data = self._process.readAllStandardError()
+        if data:
+            for line in data.data().decode("utf-8", errors="replace").rstrip("\n").split("\n"):
+                logging.warning(f"[TMSService:stderr] {line}")
+
+    def _onProcessFinished(self, exitCode, exitStatus):
+        statusName = "NormalExit" if exitStatus == qt.QProcess.NormalExit else "CrashExit"
+        logging.info(
+            f"[SlicerTMS] TMSService finished: exitCode={exitCode}, status={statusName}"
+        )
+        self._onReadyReadStdout()
+        self._onReadyReadStderr()
+        self._disconnectProcessSignals()
+
+    def _disconnectProcessSignals(self):
+        """Safely disconnect all QProcess signal connections."""
+        if self._process is None:
+            return
+        try:
+            if self._onStateChangedSlot is not None:
+                self._process.disconnect(
+                    'stateChanged(QProcess::ProcessState)', self._onStateChangedSlot
+                )
+            if self._onReadyReadOutSlot is not None:
+                self._process.disconnect(
+                    'readyReadStandardOutput()', self._onReadyReadOutSlot
+                )
+            if self._onReadyReadErrSlot is not None:
+                self._process.disconnect(
+                    'readyReadStandardError()', self._onReadyReadErrSlot
+                )
+            if self._onFinishedSlot is not None:
+                self._process.disconnect(
+                    'finished(int,QProcess::ExitStatus)', self._onFinishedSlot
+                )
+        except Exception:
+            pass
+        self._onStateChangedSlot = None
+        self._onReadyReadOutSlot = None
+        self._onReadyReadErrSlot = None
+        self._onFinishedSlot     = None
+
+    def isServiceRunning(self):
+        """Return True if the TMSService QProcess is alive."""
+        return (
+            self._process is not None
+            and self._process.state() != qt.QProcess.NotRunning
+        )
+
+    # ------------------------------------------------------------------
+
     def connectToService(self, port, max_attempts=30):
-        """Connect to running TMSService via RPyC; retry for up to 30 s."""
+        """Connect to running TMSService via RPyC; retry for up to 30 s.
+
+        Fails fast if the QProcess exits before the connection succeeds.
+        """
         import rpyc
         for _ in range(max_attempts):
+            if not self.isServiceRunning():
+                if self._process is not None:
+                    self._onReadyReadStdout()
+                    self._onReadyReadStderr()
+                raise RuntimeError(
+                    f"TMSService subprocess died before accepting connections "
+                    f"on port {port}. Check the Slicer log for details."
+                )
             try:
                 self._tms = rpyc.connect(
                     "localhost", port,
@@ -615,8 +851,9 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
 
         # Shared memory for fast E-field streaming (avoids RPyC serialisation)
         self._cleanupSharedMemory()
+        _cleanup_orphaned_shm(self._shmName)
         self._shm = multiprocessing.shared_memory.SharedMemory(
-            create=True, size=E_ref.nbytes, name=_SHARED_E_NAME
+            create=True, size=E_ref.nbytes, name=self._shmName
         )
         self._sharedE = numpy.ndarray(
             E_ref.shape, dtype=E_ref.dtype, buffer=self._shm.buf
@@ -633,7 +870,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         self.setProbeTransformNode(probe)
 
         # Paint initial E-field (probe observer already attached; data now in array)
-        self._tms.root.copy_E_to_share(_SHARED_E_NAME)
+        self._tms.root.copy_E_to_share(self._shmName)
         self._updateMeshColors()
 
         # Set color/scalar AFTER the array has valid data — setting it earlier
@@ -667,7 +904,10 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         self._tms.root.set_solver(solver)
 
     def stopService(self):
-        """Disconnect from the service and kill the subprocess."""
+        """Disconnect from the service and terminate the QProcess subprocess.
+
+        Uses graceful terminate() → waitForFinished() → kill() escalation.
+        """
         if self._probeNode is not None and self._probeObsTag is not None:
             self._probeNode.RemoveObserver(self._probeObsTag)
             self._probeObsTag = None
@@ -680,13 +920,29 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             self._tms = None
 
         if self._process is not None:
-            try:
+            self._disconnectProcessSignals()
+
+            if self._process.state() != qt.QProcess.NotRunning:
                 self._process.kill()
+                self._process.waitForFinished(3000)
+
+            # PythonSlicer is a wrapper that spawns python-real as a child.
+            # QProcess.kill() only kills the wrapper, orphaning python-real.
+            # Clean up orphaned children by port.
+            if self._port is not None:
+                _kill_processes_on_port(self._port)
+
+            # Drain final output
+            try:
+                self._onReadyReadStdout()
+                self._onReadyReadStderr()
             except Exception:
                 pass
+
             self._process = None
 
         self._cleanupSharedMemory()
+        self._port = None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -699,7 +955,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             node.GetMatrixTransformToParent(self._probeMatrix)
             mat = slicer.util.arrayFromVTKMatrix(self._probeMatrix)
             self._tms.root.update_E_field(mat.tolist())
-            self._tms.root.copy_E_to_share(_SHARED_E_NAME)
+            self._tms.root.copy_E_to_share(self._shmName)
             self._updateMeshColors()
         except Exception as exc:
             print(f"[SlicerTMS] updateEField error: {exc}")
@@ -711,14 +967,17 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         self._meshNode.GetDisplayNode().Modified()
 
     def _cleanupSharedMemory(self):
+        self._sharedE = None
         if self._shm is not None:
             try:
                 self._shm.close()
+            except Exception:
+                pass
+            try:
                 self._shm.unlink()
             except Exception:
                 pass
             self._shm = None
-        self._sharedE = None
 
 
 # ============================================================
