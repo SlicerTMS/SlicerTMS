@@ -6,6 +6,7 @@ Move the 'TMS Probe' linear transform to update the E-field in real time.
 
 import logging
 import multiprocessing.shared_memory
+import multiprocessing.spawn
 import os
 import signal
 import subprocess
@@ -28,6 +29,12 @@ _TMSWARP_SRC  = os.path.join(_TMSWARP_ROOT, "src")
 DEFAULT_PORT   = 18892
 _TEST_CACHE    = os.path.join(os.path.expanduser("~"), ".cache", "SlicerTMS")
 _LOG_DIR       = os.path.join(_TEST_CACHE, "logs")
+
+# Fix for PythonSlicer: sys._base_executable is '' in the embedded interpreter,
+# which causes multiprocessing.resource_tracker to exec an empty path and die.
+# Setting the spawn executable to sys.executable lets SharedMemory work normally.
+if not multiprocessing.spawn.get_executable():
+    multiprocessing.spawn.set_executable(sys.executable)
 
 # ---------------------------------------------------------------------------
 # Session logging — keeps the last 10 session logs
@@ -1026,17 +1033,6 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         self._shm = multiprocessing.shared_memory.SharedMemory(
             create=True, size=E_ref.nbytes, name=self._shmName
         )
-        # Unregister from resource_tracker — it spawns a subprocess that crashes
-        # in PythonSlicer's embedded environment ("process died unexpectedly" →
-        # Broken pipe).  We manage cleanup ourselves in _cleanupSharedMemory().
-        try:
-            from multiprocessing import resource_tracker
-            resource_tracker.unregister(
-                f"/{self._shmName}", "shared_memory"
-            )
-            log.info("setupVisualization: unregistered shm from resource_tracker")
-        except Exception as exc:
-            log.warning(f"setupVisualization: resource_tracker unregister failed: {exc}")
         self._sharedE = numpy.ndarray(
             E_ref.shape, dtype=E_ref.dtype, buffer=self._shm.buf
         )
