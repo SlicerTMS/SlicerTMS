@@ -9,3 +9,11 @@ lib/
 
 *~
 *.sw*
+
+# Local dev / IDE
+.claude/
+.mcp.json
+*.code-workspace
+
+# TMSWarp is its own repo (added as needed, not tracked here)
+TMSWarp/
