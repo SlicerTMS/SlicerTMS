@@ -235,14 +235,21 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
         meshRow.addWidget(dlBtn)
         svcForm.addRow("Mesh (.npz):", meshRow)
 
-        # One-click ernie setup
-        ernieBtn = qt.QPushButton("Setup Ernie Mesh + Probe  (downloads ~394 MB if needed)")
-        ernieBtn.setToolTip(
-            "Find or download ernie_data.npz, set the mesh path, "
-            "create a TMS Probe transform, and select the best available solver."
+        # One-click ernie setup — low-res (mesh only) or full (mesh + T1 MRI)
+        ernieRow = qt.QHBoxLayout()
+        ernieLowBtn = qt.QPushButton("Setup Ernie (low-res, ~394 MB)")
+        ernieLowBtn.setToolTip(
+            "Download the low-resolution mesh only. Fast download, no MRI."
         )
-        ernieBtn.clicked.connect(self._setupErnieMesh)
-        svcForm.addRow(ernieBtn)
+        ernieLowBtn.clicked.connect(lambda: self._setupErnieMesh(full=False))
+        ernieRow.addWidget(ernieLowBtn)
+        ernieFullBtn = qt.QPushButton("Setup Ernie + T1 MRI (~1.12 GB)")
+        ernieFullBtn.setToolTip(
+            "Download the full dataset with T1 MRI for background visualization."
+        )
+        ernieFullBtn.clicked.connect(lambda: self._setupErnieMesh(full=True))
+        ernieRow.addWidget(ernieFullBtn)
+        svcForm.addRow(ernieRow)
 
         # Solver combo — availability updated after creation
         self.solverCombo = qt.QComboBox()
@@ -359,11 +366,14 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
             self._setStatus(f"Download failed: {exc}")
             slicer.util.errorDisplay(str(exc))
 
-    def _setupErnieMesh(self):
+    def _setupErnieMesh(self, full=False):
         """Download ernie_data.npz if needed, load into scene, create probe, pick solver."""
-        self._setStatus("Setting up ernie mesh (may download ~394 MB) …")
+        if full:
+            self._setStatus("Setting up ernie mesh + T1 MRI (may download ~1.12 GB) …")
+        else:
+            self._setStatus("Setting up ernie mesh (may download ~394 MB) …")
         try:
-            path = self.logic.setupErnieMesh()
+            path = self.logic.setupErnieMesh(full=full)
             self.meshPathEdit.currentPath = path
         except Exception as exc:
             self._setStatus(f"Ernie setup failed: {exc}")
@@ -381,6 +391,16 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
 
         # Select the model node in the mesh node combo
         self.meshNodeSelector.setCurrentNode(modelNode)
+
+        # Load T1 MRI as background volume if available
+        if full:
+            t1Path = self.logic.findErnieT1()
+            if t1Path:
+                try:
+                    volumeNode = slicer.util.loadVolume(t1Path)
+                    slicer.util.setSliceViewerLayers(background=volumeNode)
+                except Exception as exc:
+                    log.warning(f"Could not load T1 MRI: {exc}")
 
         # Create or find the probe transform and position it above the head
         probe = slicer.mrmlScene.GetFirstNodeByName("TMS Probe")
@@ -602,18 +622,30 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         return outPath
 
     @staticmethod
-    def setupErnieMesh():
+    def setupErnieMesh(full=False):
         """Return path to ernie_data.npz, downloading and converting if needed.
+
+        Parameters
+        ----------
+        full : bool
+            If True, download the full SimNIBS v4.1 dataset (~1.12 GB) which
+            includes the T1 MRI.  If False (default), download the low-res
+            mesh-only zip (~394 MB).
 
         Search order:
           1. _TMSWARP_ROOT/ernie_data.npz  (local TMSWarp checkout)
           2. _TEST_CACHE/ernie_data.npz    (previously cached download)
-          3. Download zip + convert via meshio (~394 MB, one-time)
+          3. Download zip + convert via meshio
         """
-        _ERNIE_URL = (
+        _ERNIE_URL_LOWRES = (
             "https://github.com/simnibs/example-dataset/releases/"
             "download/v4.0-lowres/ernie_lowres_V2.zip"
         )
+        _ERNIE_URL_FULL = (
+            "https://github.com/simnibs/example-dataset/releases/"
+            "download/v4.1/simnibs4_examples.zip"
+        )
+        _ERNIE_URL = _ERNIE_URL_FULL if full else _ERNIE_URL_LOWRES
         _CONDUCTIVITY_MAP = {
             1: 0.126,   # white matter
             2: 0.275,   # gray matter
@@ -669,6 +701,16 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
                 if not msh_names:
                     raise FileNotFoundError("ernie.msh not found in downloaded zip")
                 z.extract(msh_names[0], tmp_dir)
+
+                # Also extract T1 MRI if present in the full dataset
+                t1_names = [n for n in z.namelist() if n.endswith("ernie_T1.nii.gz")]
+                if full and t1_names:
+                    z.extract(t1_names[0], tmp_dir)
+                    t1_src = os.path.join(tmp_dir, t1_names[0])
+                    t1_cached = os.path.join(_TEST_CACHE, "ernie_T1.nii.gz")
+                    shutil.copy2(t1_src, t1_cached)
+                    print(f"Cached T1 MRI → {t1_cached}")
+
             msh_path = os.path.join(tmp_dir, msh_names[0])
 
             print(f"Converting {msh_path} with meshio …")
@@ -696,6 +738,12 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
                 pass
 
         return cached
+
+    @staticmethod
+    def findErnieT1():
+        """Return cached ernie_T1.nii.gz path if it exists, else None."""
+        path = os.path.join(_TEST_CACHE, "ernie_T1.nii.gz")
+        return path if os.path.isfile(path) else None
 
     # ------------------------------------------------------------------
     # Mesh loading into Slicer scene
