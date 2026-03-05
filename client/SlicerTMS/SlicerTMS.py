@@ -86,6 +86,15 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
         meshRow.addWidget(dlBtn)
         svcForm.addRow("Mesh (.npz):", meshRow)
 
+        # One-click ernie setup
+        ernieBtn = qt.QPushButton("Setup Ernie Mesh + Probe  (downloads ~394 MB if needed)")
+        ernieBtn.setToolTip(
+            "Find or download ernie_data.npz, set the mesh path, "
+            "create a TMS Probe transform, and select the best available solver."
+        )
+        ernieBtn.clicked.connect(self._setupErnieMesh)
+        svcForm.addRow(ernieBtn)
+
         # Solver combo — availability updated after creation
         self.solverCombo = qt.QComboBox()
         self.solverCombo.addItem("NumPy  —  pre-factorized LU,  CPU",       "numpy")
@@ -197,6 +206,39 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
         except Exception as exc:
             self._setStatus(f"Download failed: {exc}")
             slicer.util.errorDisplay(str(exc))
+
+    def _setupErnieMesh(self):
+        """Download ernie_data.npz if needed, set mesh path, create probe, pick best solver."""
+        self._setStatus("Setting up ernie mesh (may download ~394 MB) …")
+        try:
+            path = self.logic.setupErnieMesh()
+            self.meshPathEdit.currentPath = path
+            self._setStatus(f"Ernie mesh ready: {os.path.basename(path)}")
+        except Exception as exc:
+            self._setStatus(f"Ernie setup failed: {exc}")
+            slicer.util.errorDisplay(str(exc))
+            return
+
+        # Create or find the probe transform and position it above the head
+        probe = slicer.mrmlScene.GetFirstNodeByName("TMS Probe")
+        if probe is None:
+            probe = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLLinearTransformNode", "TMS Probe"
+            )
+            probe.CreateDefaultDisplayNodes()
+            probe.GetDisplayNode().SetEditorVisibility(True)
+
+        mat = vtk.vtkMatrix4x4()   # identity — coil above head at origin
+        mat.SetElement(2, 3, 100.0)  # z = 100 mm (above head)
+        probe.SetMatrixTransformToParent(mat)
+        self.probeSelector.setCurrentNode(probe)
+
+        # Pick the best available solver
+        self._updateSolverAvailability()
+        self._setStatus(
+            "Ernie ready. Click 'Start Service' to begin "
+            f"(solver: {self.solverCombo.currentData})."
+        )
 
     def _updateSolverAvailability(self):
         """Gray out solver options that are not currently usable."""
@@ -386,6 +428,102 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         if not os.path.isfile(outPath):
             raise FileNotFoundError("ernie_data.npz not found after fetch_ernie.py ran")
         return outPath
+
+    @staticmethod
+    def setupErnieMesh():
+        """Return path to ernie_data.npz, downloading and converting if needed.
+
+        Search order:
+          1. _TMSWARP_ROOT/ernie_data.npz  (local TMSWarp checkout)
+          2. _TEST_CACHE/ernie_data.npz    (previously cached download)
+          3. Download zip + convert via meshio (~394 MB, one-time)
+        """
+        _ERNIE_URL = (
+            "https://github.com/simnibs/example-dataset/releases/"
+            "download/v4.0-lowres/ernie_lowres_V2.zip"
+        )
+        _CONDUCTIVITY_MAP = {
+            1: 0.126,   # white matter
+            2: 0.275,   # gray matter
+            3: 1.654,   # CSF
+            4: 0.010,   # skull
+            5: 0.465,   # scalp
+            6: 0.500,   # eye balls
+        }
+
+        # 1. Local checkout
+        local = os.path.join(_TMSWARP_ROOT, "ernie_data.npz")
+        if os.path.isfile(local):
+            return local
+
+        # 2. Cache
+        os.makedirs(_TEST_CACHE, exist_ok=True)
+        cached = os.path.join(_TEST_CACHE, "ernie_data.npz")
+        if os.path.isfile(cached):
+            return cached
+
+        # 3. Download + convert
+        # Try SimNIBS Python first (has mesh_io, avoids meshio dependency)
+        fetch_script = os.path.join(_TMSWARP_ROOT, "scripts", "fetch_ernie.py")
+        simnibs_python = os.path.join(
+            os.path.expanduser("~"), "Applications",
+            "SimNIBS-4.5", "simnibs_env", "bin", "python",
+        )
+        if os.path.isfile(simnibs_python) and os.path.isfile(fetch_script):
+            result = subprocess.run(
+                [simnibs_python, fetch_script],
+                capture_output=True, text=True, cwd=_TMSWARP_ROOT,
+            )
+            if result.returncode == 0 and os.path.isfile(local):
+                return local
+
+        # Fall back: download zip and convert with meshio (no SimNIBS needed)
+        slicer.util.pip_install("meshio")
+        import meshio
+        import shutil
+        import tempfile
+        import urllib.request
+        import zipfile
+        import numpy as _np
+
+        print(f"Downloading ernie dataset from {_ERNIE_URL} …")
+        tmp_zip = tempfile.mktemp(suffix=".zip")
+        urllib.request.urlretrieve(_ERNIE_URL, tmp_zip)
+
+        tmp_dir = tempfile.mkdtemp(prefix="ernie_extract_")
+        try:
+            with zipfile.ZipFile(tmp_zip) as z:
+                msh_names = [n for n in z.namelist() if n.endswith("ernie.msh")]
+                if not msh_names:
+                    raise FileNotFoundError("ernie.msh not found in downloaded zip")
+                z.extract(msh_names[0], tmp_dir)
+            msh_path = os.path.join(tmp_dir, msh_names[0])
+
+            print(f"Converting {msh_path} with meshio …")
+            m = meshio.read(msh_path)
+
+            # SimNIBS .msh: points are in mm; tetrahedra carry physical group tags
+            nodes_m = m.points * 1e-3                               # mm → metres
+            tets    = m.cells_dict["tetra"].astype(_np.int32)       # 0-based
+            tags    = m.cell_data_dict["gmsh:physical"]["tetra"].astype(_np.int32)
+            sigma   = _np.array(
+                [_CONDUCTIVITY_MAP.get(int(t), 0.275) for t in tags],
+                dtype=_np.float64,
+            )
+
+            _np.savez_compressed(
+                cached,
+                nodes=nodes_m, elements=tets, conductivity=sigma, tag1=tags,
+            )
+            print(f"Saved ernie_data.npz → {cached}")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            try:
+                os.remove(tmp_zip)
+            except Exception:
+                pass
+
+        return cached
 
     # ------------------------------------------------------------------
     # Service lifecycle
