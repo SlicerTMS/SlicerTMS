@@ -308,16 +308,27 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
             slicer.util.errorDisplay(str(exc))
 
     def _setupErnieMesh(self):
-        """Download ernie_data.npz if needed, set mesh path, create probe, pick best solver."""
+        """Download ernie_data.npz if needed, load into scene, create probe, pick solver."""
         self._setStatus("Setting up ernie mesh (may download ~394 MB) …")
         try:
             path = self.logic.setupErnieMesh()
             self.meshPathEdit.currentPath = path
-            self._setStatus(f"Ernie mesh ready: {os.path.basename(path)}")
         except Exception as exc:
             self._setStatus(f"Ernie setup failed: {exc}")
             slicer.util.errorDisplay(str(exc))
             return
+
+        # Load mesh into scene with conductivity/tag1/Enorm scalars
+        self._setStatus("Loading mesh into scene …")
+        try:
+            modelNode = self.logic.loadMeshToScene(path)
+        except Exception as exc:
+            self._setStatus(f"Mesh loading failed: {exc}")
+            slicer.util.errorDisplay(str(exc))
+            return
+
+        # Select the model node in the mesh node combo
+        self.meshNodeSelector.setCurrentNode(modelNode)
 
         # Create or find the probe transform and position it above the head
         probe = slicer.mrmlScene.GetFirstNodeByName("TMS Probe")
@@ -336,7 +347,7 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
         # Pick the best available solver
         self._updateSolverAvailability()
         self._setStatus(
-            "Ernie ready. Click 'Start Service' to begin "
+            "Ernie mesh loaded (conductivity display). Click 'Start Service' to begin "
             f"(solver: {self.solverCombo.currentData})."
         )
 
@@ -397,7 +408,9 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
             self.logic.initializeFEM(meshPath, solver)
             self._setStatus("Setting up visualization …")
             self.logic.setupVisualization()
-            # Select the auto-created probe in the combo
+            # Select the mesh node and probe in the combos
+            if self.logic._meshNode is not None:
+                self.meshNodeSelector.setCurrentNode(self.logic._meshNode)
             probe = slicer.mrmlScene.GetFirstNodeByName("TMS Probe")
             if probe:
                 self.probeSelector.setCurrentNode(probe)
@@ -633,6 +646,90 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         return cached
 
     # ------------------------------------------------------------------
+    # Mesh loading into Slicer scene
+    # ------------------------------------------------------------------
+
+    def loadMeshToScene(self, npzPath):
+        """Load a TMSWarp .npz mesh into the Slicer scene as a model node.
+
+        Creates a vtkUnstructuredGrid with tetrahedral cells and three
+        cell-data scalar arrays:
+          - "Enorm"        — E-field magnitude (initially zero)
+          - "conductivity" — tissue conductivity in S/m
+          - "tag1"         — tissue type label (1-6), if present in the .npz
+
+        Returns the vtkMRMLModelNode.  Sets self._meshNode.
+        """
+        data = numpy.load(npzPath)
+        nodes_m      = data["nodes"].astype(numpy.float64)
+        elements     = data["elements"].astype(numpy.int32)
+        conductivity = data["conductivity"].astype(numpy.float64)
+        tag1         = data["tag1"].astype(numpy.int32) if "tag1" in data else None
+
+        nodes_mm = nodes_m * 1000.0  # metres → mm for VTK / Slicer
+
+        # --- Build VTK unstructured tetrahedral grid ---
+        meshGrid = vtk.vtkUnstructuredGrid()
+
+        pts = vtk.vtkPoints()
+        pts.SetNumberOfPoints(len(nodes_mm))
+        vtk.util.numpy_support.vtk_to_numpy(pts.GetData())[:] = nodes_mm
+        meshGrid.SetPoints(pts)
+
+        # VTK 9.5 requires int64 connectivity for vtkCellArray.SetData()
+        nCells = elements.shape[0]
+        offsets = numpy.arange(0, nCells * 4 + 1, 4, dtype=numpy.int64)
+        connectivity = elements.ravel().astype(numpy.int64)
+        cells = vtk.vtkCellArray()
+        cells.SetData(
+            vtk.util.numpy_support.numpy_to_vtk(offsets, deep=True),
+            vtk.util.numpy_support.numpy_to_vtk(connectivity, deep=True),
+        )
+        meshGrid.SetCells(vtk.VTK_TETRA, cells)
+
+        # --- Cell-data scalar arrays ---
+        eArr = vtk.vtkDoubleArray()
+        eArr.SetName("Enorm")
+        eArr.SetNumberOfValues(nCells)
+        eArr.FillComponent(0, 0.0)
+        meshGrid.GetCellData().AddArray(eArr)
+
+        condArr = vtk.vtkDoubleArray()
+        condArr.SetName("conductivity")
+        condArr.SetNumberOfValues(nCells)
+        vtk.util.numpy_support.vtk_to_numpy(condArr)[:] = conductivity
+        meshGrid.GetCellData().AddArray(condArr)
+
+        if tag1 is not None:
+            tagArr = vtk.vtkIntArray()
+            tagArr.SetName("tag1")
+            tagArr.SetNumberOfValues(nCells)
+            vtk.util.numpy_support.vtk_to_numpy(tagArr)[:] = tag1
+            meshGrid.GetCellData().AddArray(tagArr)
+
+        # --- Create or reuse Slicer model node ---
+        existing = slicer.mrmlScene.GetFirstNodeByName("TMS E-field")
+        if existing and existing.IsA("vtkMRMLModelNode"):
+            modelNode = existing
+            modelNode.SetAndObserveMesh(meshGrid)
+        else:
+            modelNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
+            modelNode.SetName("TMS E-field")
+            modelNode.SetAndObserveMesh(meshGrid)
+            modelNode.CreateDefaultDisplayNodes()
+
+        # Default display: conductivity with Viridis (before service starts)
+        dn = modelNode.GetDisplayNode()
+        dn.SetAndObserveColorNodeID("vtkMRMLColorTableNodeFileViridis.txt")
+        dn.SetActiveScalar("conductivity", vtk.vtkAssignAttribute.CELL_DATA)
+        dn.SetScalarVisibility(True)
+        dn.SetAutoScalarRange(True)
+        dn.Modified()
+
+        self._meshNode = modelNode
+        return modelNode
+
+    # ------------------------------------------------------------------
     # Service lifecycle
     # ------------------------------------------------------------------
 
@@ -815,39 +912,50 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
     # ------------------------------------------------------------------
 
     def setupVisualization(self):
-        """Build VTK mesh model node and shared-memory E-field buffer."""
+        """Set up shared-memory E-field buffer and configure live display.
+
+        If self._meshNode already has a valid mesh (from loadMeshToScene),
+        reuses it.  Otherwise builds the grid from TMSService data.
+        """
         if self._tms is None:
             raise RuntimeError("Not connected to TMSService.")
 
-        nodes_mm = numpy.array(self._tms.root.nodes_mm)   # (N, 3) mm
-        elements = numpy.array(self._tms.root.elements)   # (M, 4) 0-based
-        E_ref    = numpy.array(self._tms.root.E)           # (M, 3) initial E
+        E_ref = numpy.array(self._tms.root.E)  # (M, 3) — always needed
 
-        # Build VTK unstructured tetrahedral grid
-        meshGrid = vtk.vtkUnstructuredGrid()
-        pts = vtk.vtkPoints()
-        pts.SetNumberOfPoints(len(nodes_mm))
-        vtk.util.numpy_support.vtk_to_numpy(pts.GetData())[:] = nodes_mm
-        meshGrid.SetPoints(pts)
+        # Reuse existing mesh node if loadMeshToScene() was called earlier;
+        # otherwise build from service data (backward compat / direct start).
+        if (self._meshNode is None
+                or self._meshNode.GetMesh() is None
+                or self._meshNode.GetMesh().GetNumberOfCells() == 0):
+            nodes_mm = numpy.array(self._tms.root.nodes_mm)
+            elements = numpy.array(self._tms.root.elements)
 
-        offsets = numpy.arange(0, elements.shape[0] * 4 + 1, 4, dtype=numpy.int64)
-        cells   = vtk.vtkCellArray()
-        cells.SetData(
-            vtk.util.numpy_support.numpy_to_vtk(offsets, deep=True),
-            vtk.util.numpy_support.numpy_to_vtk(elements.ravel(), deep=True),
-        )
-        meshGrid.SetCells(vtk.VTK_TETRA, cells)
+            meshGrid = vtk.vtkUnstructuredGrid()
+            pts = vtk.vtkPoints()
+            pts.SetNumberOfPoints(len(nodes_mm))
+            vtk.util.numpy_support.vtk_to_numpy(pts.GetData())[:] = nodes_mm
+            meshGrid.SetPoints(pts)
 
-        eArr = vtk.vtkDoubleArray()
-        eArr.SetNumberOfValues(elements.shape[0])
-        eArr.SetName("Enorm")
-        meshGrid.GetCellData().AddArray(eArr)
+            # VTK 9.5 requires int64 connectivity
+            nCells = elements.shape[0]
+            offsets = numpy.arange(0, nCells * 4 + 1, 4, dtype=numpy.int64)
+            connectivity = elements.ravel().astype(numpy.int64)
+            cells = vtk.vtkCellArray()
+            cells.SetData(
+                vtk.util.numpy_support.numpy_to_vtk(offsets, deep=True),
+                vtk.util.numpy_support.numpy_to_vtk(connectivity, deep=True),
+            )
+            meshGrid.SetCells(vtk.VTK_TETRA, cells)
 
-        # Create Slicer model node (no color setup yet — must happen after data is filled)
-        self._meshNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
-        self._meshNode.SetName("TMS E-field")
-        self._meshNode.SetAndObserveMesh(meshGrid)
-        self._meshNode.CreateDefaultDisplayNodes()
+            eArr = vtk.vtkDoubleArray()
+            eArr.SetName("Enorm")
+            eArr.SetNumberOfValues(nCells)
+            meshGrid.GetCellData().AddArray(eArr)
+
+            self._meshNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
+            self._meshNode.SetName("TMS E-field")
+            self._meshNode.SetAndObserveMesh(meshGrid)
+            self._meshNode.CreateDefaultDisplayNodes()
 
         # Shared memory for fast E-field streaming (avoids RPyC serialisation)
         self._cleanupSharedMemory()
@@ -869,12 +977,11 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             probe.GetDisplayNode().SetEditorVisibility(True)
         self.setProbeTransformNode(probe)
 
-        # Paint initial E-field (probe observer already attached; data now in array)
+        # Paint initial E-field
         self._tms.root.copy_E_to_share(self._shmName)
         self._updateMeshColors()
 
-        # Set color/scalar AFTER the array has valid data — setting it earlier
-        # causes Slicer to ignore the scalar overlay (see SlicerSimNIBSClient comment)
+        # Switch display to Enorm (from conductivity if loadMeshToScene ran earlier)
         dn = self._meshNode.GetDisplayNode()
         dn.SetAndObserveColorNodeID("vtkMRMLColorTableNodeFileViridis.txt")
         dn.SetActiveScalar("Enorm", vtk.vtkAssignAttribute.CELL_DATA)
