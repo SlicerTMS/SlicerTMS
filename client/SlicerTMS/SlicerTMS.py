@@ -607,15 +607,11 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         eArr.SetName("Enorm")
         meshGrid.GetCellData().AddArray(eArr)
 
-        # Create Slicer model node
+        # Create Slicer model node (no color setup yet — must happen after data is filled)
         self._meshNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
         self._meshNode.SetName("TMS E-field")
         self._meshNode.SetAndObserveMesh(meshGrid)
         self._meshNode.CreateDefaultDisplayNodes()
-        dn = self._meshNode.GetDisplayNode()
-        dn.SetAndObserveColorNodeID("vtkMRMLColorTableNodeFileViridis.txt")
-        dn.SetScalarVisibility(True)
-        dn.SetActiveScalar("Enorm", vtk.vtkAssignAttribute.CELL_DATA)
 
         # Shared memory for fast E-field streaming (avoids RPyC serialisation)
         self._cleanupSharedMemory()
@@ -626,10 +622,6 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             E_ref.shape, dtype=E_ref.dtype, buffer=self._shm.buf
         )
 
-        # Paint initial E-field
-        self._tms.root.copy_E_to_share(_SHARED_E_NAME)
-        self._updateMeshColors()
-
         # Create default probe transform if none exists
         probe = slicer.mrmlScene.GetFirstNodeByName("TMS Probe")
         if probe is None:
@@ -639,6 +631,18 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             probe.CreateDefaultDisplayNodes()
             probe.GetDisplayNode().SetEditorVisibility(True)
         self.setProbeTransformNode(probe)
+
+        # Paint initial E-field (probe observer already attached; data now in array)
+        self._tms.root.copy_E_to_share(_SHARED_E_NAME)
+        self._updateMeshColors()
+
+        # Set color/scalar AFTER the array has valid data — setting it earlier
+        # causes Slicer to ignore the scalar overlay (see SlicerSimNIBSClient comment)
+        dn = self._meshNode.GetDisplayNode()
+        dn.SetAndObserveColorNodeID("vtkMRMLColorTableNodeFileViridis.txt")
+        dn.SetActiveScalar("Enorm", vtk.vtkAssignAttribute.CELL_DATA)
+        dn.SetScalarVisibility(True)
+        dn.Modified()
 
     def setProbeTransformNode(self, node):
         """Attach / detach the E-field update observer to a transform node."""
