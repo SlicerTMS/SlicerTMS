@@ -342,10 +342,13 @@ class TMSService(rpyc.SlaveService):
     def _resolve_mesh_path(self, mesh_path):
         if mesh_path and os.path.isfile(mesh_path):
             return mesh_path
+        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "SlicerTMS")
+        search_dirs = [_TMSWARP_ROOT, cache_dir]
         for name in ("ernie_data.npz", "sphere3_data.npz"):
-            candidate = os.path.join(_TMSWARP_ROOT, name)
-            if os.path.isfile(candidate):
-                return candidate
+            for d in search_dirs:
+                candidate = os.path.join(d, name)
+                if os.path.isfile(candidate):
+                    return candidate
         raise FileNotFoundError(
             "No mesh file found. Run TMSWarp/scripts/fetch_ernie.py first, "
             "or pass an explicit mesh_path to initialize_system()."
