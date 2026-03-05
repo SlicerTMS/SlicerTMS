@@ -919,6 +919,8 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         if data:
             for line in data.data().decode("utf-8", errors="replace").rstrip("\n").split("\n"):
                 log.info(f"[TMSService] {line}")
+                if line.startswith("E_UPDATED") and self._sharedE is not None:
+                    self._updateMeshColors()
 
     def _onReadyReadStderr(self):
         if self._process is None:
@@ -1089,6 +1091,20 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         )
         log.info("setupVisualization: shared memory created OK")
 
+        # Switch display to Enorm (from conductivity if loadMeshToScene ran earlier)
+        dn = self._meshNode.GetDisplayNode()
+        dn.SetAndObserveColorNodeID("vtkMRMLColorTableNodeFileViridis.txt")
+        dn.SetActiveScalar("Enorm", vtk.vtkAssignAttribute.CELL_DATA)
+        dn.SetScalarVisibility(True)
+        dn.Modified()
+
+        # Start streaming solve loop (non-blocking — runs in service process)
+        import rpyc
+        log.info("setupVisualization: starting streaming solve loop")
+        self._streamingResult = rpyc.async_(
+            self._tms.root.start_streaming
+        )(self._shmName)
+
         # Create default probe transform if none exists
         probe = slicer.mrmlScene.GetFirstNodeByName("TMS Probe")
         if probe is None:
@@ -1099,17 +1115,6 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             probe.GetDisplayNode().SetEditorVisibility(True)
         self.setProbeTransformNode(probe)
 
-        # Paint initial E-field
-        self._tms.root.copy_E_to_share(self._shmName)
-        self._updateMeshColors()
-
-        # Switch display to Enorm (from conductivity if loadMeshToScene ran earlier)
-        dn = self._meshNode.GetDisplayNode()
-        dn.SetAndObserveColorNodeID("vtkMRMLColorTableNodeFileViridis.txt")
-        dn.SetActiveScalar("Enorm", vtk.vtkAssignAttribute.CELL_DATA)
-        dn.SetScalarVisibility(True)
-        dn.Modified()
-
     def setProbeTransformNode(self, node):
         """Attach / detach the E-field update observer to a transform node."""
         if self._probeNode is not None and self._probeObsTag is not None:
@@ -1117,7 +1122,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             self._probeObsTag = None
 
         self._probeNode = node
-        if node is None or self._tms is None:
+        if node is None or self._process is None:
             return
 
         self._probeObsTag = node.AddObserver(
@@ -1150,11 +1155,21 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             self._tms = None
 
         if self._process is not None:
+            # Signal the streaming solve loop to exit gracefully
+            if self._process.state() != qt.QProcess.NotRunning:
+                try:
+                    self._process.write(b"STOP\n")
+                    self._process.waitForBytesWritten(1000)
+                except Exception:
+                    pass
+
             self._disconnectProcessSignals()
 
             if self._process.state() != qt.QProcess.NotRunning:
-                self._process.kill()
-                self._process.waitForFinished(3000)
+                self._process.terminate()
+                if not self._process.waitForFinished(3000):
+                    self._process.kill()
+                    self._process.waitForFinished(3000)
 
             # PythonSlicer is a wrapper that spawns python-real as a child.
             # QProcess.kill() only kills the wrapper, orphaning python-real.
@@ -1180,16 +1195,16 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
     # ------------------------------------------------------------------
 
     def _onProbeTransformModified(self, node, event):
-        if self._tms is None or self._meshNode is None:
+        if self._process is None or self._meshNode is None:
             return
         try:
             node.GetMatrixTransformToParent(self._probeMatrix)
             mat = slicer.util.arrayFromVTKMatrix(self._probeMatrix)
             pos = mat[:3, 3]
             log.debug(f"probe moved: pos=[{pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}]")
-            self._tms.root.update_E_field(mat.tolist())
-            self._tms.root.copy_E_to_share(self._shmName)
-            self._updateMeshColors()
+            # Send probe position via QProcess stdin — non-blocking
+            vals = " ".join(f"{v:.6f}" for v in mat.ravel())
+            self._process.write(f"PROBE {vals}\n".encode("utf-8"))
         except Exception as exc:
             log.error(f"updateEField error: {exc}", exc_info=True)
 
