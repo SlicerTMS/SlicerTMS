@@ -392,15 +392,14 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
         # Select the model node in the mesh node combo
         self.meshNodeSelector.setCurrentNode(modelNode)
 
-        # Load T1 MRI as background volume if available
-        if full:
-            t1Path = self.logic.findErnieT1()
-            if t1Path:
-                try:
-                    volumeNode = slicer.util.loadVolume(t1Path)
-                    slicer.util.setSliceViewerLayers(background=volumeNode)
-                except Exception as exc:
-                    log.warning(f"Could not load T1 MRI: {exc}")
+        # Load T1 MRI as background volume if available (same space as mesh)
+        t1Path = self.logic.findErnieT1()
+        if t1Path:
+            try:
+                volumeNode = slicer.util.loadVolume(t1Path)
+                slicer.util.setSliceViewerLayers(background=volumeNode)
+            except Exception as exc:
+                log.warning(f"Could not load T1 MRI: {exc}")
 
         # Create or find the probe transform and position it above the head
         probe = slicer.mrmlScene.GetFirstNodeByName("TMS Probe")
@@ -655,25 +654,29 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             6: 0.500,   # eye balls
         }
 
+        t1_cached = os.path.join(_TEST_CACHE, "ernie_T1.nii.gz")
+        need_t1 = full and not os.path.isfile(t1_cached)
+
         # 1. Local checkout
         local = os.path.join(_TMSWARP_ROOT, "ernie_data.npz")
-        if os.path.isfile(local):
+        if os.path.isfile(local) and not need_t1:
             return local
 
         # 2. Cache
         os.makedirs(_TEST_CACHE, exist_ok=True)
         cached = os.path.join(_TEST_CACHE, "ernie_data.npz")
-        if os.path.isfile(cached):
+        if os.path.isfile(cached) and not need_t1:
             return cached
 
         # 3. Download + convert
         # Try SimNIBS Python first (has mesh_io, avoids meshio dependency)
+        # Skip this path when we need T1 — fetch_ernie.py only gets the low-res zip
         fetch_script = os.path.join(_TMSWARP_ROOT, "scripts", "fetch_ernie.py")
         simnibs_python = os.path.join(
             os.path.expanduser("~"), "Applications",
             "SimNIBS-4.5", "simnibs_env", "bin", "python",
         )
-        if os.path.isfile(simnibs_python) and os.path.isfile(fetch_script):
+        if not need_t1 and os.path.isfile(simnibs_python) and os.path.isfile(fetch_script):
             result = subprocess.run(
                 [simnibs_python, fetch_script],
                 capture_output=True, text=True, cwd=_TMSWARP_ROOT,
