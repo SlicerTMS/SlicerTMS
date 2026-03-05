@@ -27,6 +27,53 @@ _TMSWARP_SRC  = os.path.join(_TMSWARP_ROOT, "src")
 
 DEFAULT_PORT   = 18892
 _TEST_CACHE    = os.path.join(os.path.expanduser("~"), ".cache", "SlicerTMS")
+_LOG_DIR       = os.path.join(_TEST_CACHE, "logs")
+
+# ---------------------------------------------------------------------------
+# Session logging — keeps the last 10 session logs
+# ---------------------------------------------------------------------------
+
+def _setup_session_logger():
+    """Create a per-session file logger under ~/.cache/SlicerTMS/logs/.
+
+    Rotates old logs so only the 10 most recent are kept.
+    Returns the logger instance.
+    """
+    import datetime, glob
+
+    os.makedirs(_LOG_DIR, exist_ok=True)
+
+    # Rotate: keep only last 9 (the new one will make 10)
+    existing = sorted(glob.glob(os.path.join(_LOG_DIR, "tms_session_*.log")))
+    while len(existing) >= 10:
+        try:
+            os.remove(existing.pop(0))
+        except OSError:
+            pass
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(_LOG_DIR, f"tms_session_{stamp}.log")
+
+    logger = logging.getLogger("SlicerTMS")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = True  # also send to Slicer's log handler
+
+    # Remove any stale file handlers from a previous module reload
+    for h in logger.handlers[:]:
+        if isinstance(h, logging.FileHandler):
+            h.close()
+            logger.removeHandler(h)
+
+    fh = logging.FileHandler(log_path, mode="w")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)-7s  %(message)s", datefmt="%H:%M:%S"
+    ))
+    logger.addHandler(fh)
+    logger.info(f"Session log: {log_path}")
+    return logger
+
+log = _setup_session_logger()
 
 # QProcess enum → human-readable name (pattern from SlicerParallelProcessing)
 _QProcessStateNames = {
@@ -102,13 +149,11 @@ def _kill_processes_on_port(port):
         try:
             os.kill(pid, signal.SIGKILL)
             killed.append(pid)
-            logging.info(f"[SlicerTMS] Killed zombie process {pid} on port {port}")
+            log.info(f"Killed zombie process {pid} on port {port}")
         except ProcessLookupError:
             pass
         except PermissionError:
-            logging.warning(
-                f"[SlicerTMS] No permission to kill PID {pid} on port {port}"
-            )
+            log.warning(f"No permission to kill PID {pid} on port {port}")
     return killed
 
 
@@ -118,11 +163,11 @@ def _cleanup_orphaned_shm(name):
         shm = multiprocessing.shared_memory.SharedMemory(name=name, create=False)
         shm.close()
         shm.unlink()
-        logging.info(f"[SlicerTMS] Cleaned up orphaned shared memory '{name}'")
+        log.info(f"Cleaned up orphaned shared memory '{name}'")
     except FileNotFoundError:
         pass
     except Exception as exc:
-        logging.warning(f"[SlicerTMS] Could not clean shared memory '{name}': {exc}")
+        log.warning(f"Could not clean shared memory '{name}': {exc}")
 
 
 # ============================================================
@@ -660,6 +705,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
 
         Returns the vtkMRMLModelNode.  Sets self._meshNode.
         """
+        log.info(f"loadMeshToScene: {npzPath}")
         data = numpy.load(npzPath)
         nodes_m      = data["nodes"].astype(numpy.float64)
         elements     = data["elements"].astype(numpy.int32)
@@ -718,6 +764,8 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             modelNode.SetAndObserveMesh(meshGrid)
             modelNode.CreateDefaultDisplayNodes()
 
+        log.info(f"loadMeshToScene: {nCells} cells, {len(nodes_mm)} points")
+
         # Default display: conductivity with Viridis (before service starts)
         dn = modelNode.GetDisplayNode()
         dn.SetAndObserveColorNodeID("vtkMRMLColorTableNodeFileViridis.txt")
@@ -739,6 +787,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         Kills zombie processes on the port and cleans orphaned shared
         memory before launching.
         """
+        log.info(f"startService: mesh={meshPath}, solver={solver}, port={port}")
         if self._process is not None:
             self.stopService()
         if not os.path.isfile(_SERVICE_PATH):
@@ -751,9 +800,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         # Zombie cleanup
         killed = _kill_processes_on_port(port)
         if killed:
-            logging.info(
-                f"[SlicerTMS] Killed {len(killed)} zombie(s) on port {port}: {killed}"
-            )
+            log.info(f"Killed {len(killed)} zombie(s) on port {port}: {killed}")
             time.sleep(1.0)  # OS needs time to release the port after SIGKILL
 
         # Orphaned shared-memory cleanup
@@ -794,6 +841,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         if not self._process.waitForStarted(5000):
             error = _QProcessErrorNames.get(self._process.error(), "Unknown")
             raise RuntimeError(f"TMSService QProcess failed to start: {error}")
+        log.info(f"QProcess started, PID={self._process.processId()}")
 
     # ------------------------------------------------------------------
     # QProcess signal handlers
@@ -801,10 +849,10 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
 
     def _onProcessStateChanged(self, newState):
         name = _QProcessStateNames.get(newState, f"Unknown({newState})")
-        logging.info(f"[SlicerTMS] TMSService state: {name}")
+        log.info(f"TMSService state: {name}")
         if self._process and self._process.error() != qt.QProcess.UnknownError:
             err = _QProcessErrorNames.get(self._process.error(), "?")
-            logging.warning(f"[SlicerTMS] TMSService error: {err}")
+            log.warning(f"TMSService error: {err}")
 
     def _onReadyReadStdout(self):
         if self._process is None:
@@ -812,7 +860,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         data = self._process.readAllStandardOutput()
         if data:
             for line in data.data().decode("utf-8", errors="replace").rstrip("\n").split("\n"):
-                logging.info(f"[TMSService] {line}")
+                log.info(f"[TMSService] {line}")
 
     def _onReadyReadStderr(self):
         if self._process is None:
@@ -820,12 +868,12 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         data = self._process.readAllStandardError()
         if data:
             for line in data.data().decode("utf-8", errors="replace").rstrip("\n").split("\n"):
-                logging.warning(f"[TMSService:stderr] {line}")
+                log.warning(f"[TMSService:stderr] {line}")
 
     def _onProcessFinished(self, exitCode, exitStatus):
         statusName = "NormalExit" if exitStatus == qt.QProcess.NormalExit else "CrashExit"
-        logging.info(
-            f"[SlicerTMS] TMSService finished: exitCode={exitCode}, status={statusName}"
+        log.info(
+            f"TMSService finished: exitCode={exitCode}, status={statusName}"
         )
         self._onReadyReadStdout()
         self._onReadyReadStderr()
@@ -873,6 +921,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
 
         Fails fast if the QProcess exits before the connection succeeds.
         """
+        log.info(f"connectToService: port={port}, max_attempts={max_attempts}")
         import rpyc
         for _ in range(max_attempts):
             if not self.isServiceRunning():
@@ -892,6 +941,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
                         "sync_request_timeout": None,
                     },
                 )
+                log.info("RPyC connection established")
                 return
             except ConnectionRefusedError:
                 slicer.app.processEvents()
@@ -905,7 +955,9 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         """Call initialize_system() on the service (may take several minutes)."""
         if self._tms is None:
             raise RuntimeError("Not connected to TMSService — call connectToService() first.")
+        log.info(f"initializeFEM: mesh={meshPath}, solver={solver}")
         self._tms.root.initialize_system(meshPath or None, solver)
+        log.info("initializeFEM: complete")
 
     # ------------------------------------------------------------------
     # Visualization
@@ -917,16 +969,19 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         If self._meshNode already has a valid mesh (from loadMeshToScene),
         reuses it.  Otherwise builds the grid from TMSService data.
         """
+        log.info("setupVisualization: start")
         if self._tms is None:
             raise RuntimeError("Not connected to TMSService.")
 
         E_ref = numpy.array(self._tms.root.E)  # (M, 3) — always needed
+        log.info(f"setupVisualization: E_ref shape={E_ref.shape}, dtype={E_ref.dtype}")
 
         # Reuse existing mesh node if loadMeshToScene() was called earlier;
         # otherwise build from service data (backward compat / direct start).
         if (self._meshNode is None
                 or self._meshNode.GetMesh() is None
                 or self._meshNode.GetMesh().GetNumberOfCells() == 0):
+            log.info("setupVisualization: building grid from service data (no prior mesh)")
             nodes_mm = numpy.array(self._tms.root.nodes_mm)
             elements = numpy.array(self._tms.root.elements)
 
@@ -957,15 +1012,35 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             self._meshNode.SetAndObserveMesh(meshGrid)
             self._meshNode.CreateDefaultDisplayNodes()
 
+        log.info(f"setupVisualization: reusing existing mesh node "
+                 f"({self._meshNode.GetMesh().GetNumberOfCells()} cells)"
+                 if self._meshNode and self._meshNode.GetMesh()
+                    and self._meshNode.GetMesh().GetNumberOfCells() > 0
+                 else "setupVisualization: mesh node ready")
+
         # Shared memory for fast E-field streaming (avoids RPyC serialisation)
         self._cleanupSharedMemory()
         _cleanup_orphaned_shm(self._shmName)
+        log.info(f"setupVisualization: creating shared memory '{self._shmName}', "
+                 f"size={E_ref.nbytes} bytes")
         self._shm = multiprocessing.shared_memory.SharedMemory(
             create=True, size=E_ref.nbytes, name=self._shmName
         )
+        # Unregister from resource_tracker — it spawns a subprocess that crashes
+        # in PythonSlicer's embedded environment ("process died unexpectedly" →
+        # Broken pipe).  We manage cleanup ourselves in _cleanupSharedMemory().
+        try:
+            from multiprocessing import resource_tracker
+            resource_tracker.unregister(
+                f"/{self._shmName}", "shared_memory"
+            )
+            log.info("setupVisualization: unregistered shm from resource_tracker")
+        except Exception as exc:
+            log.warning(f"setupVisualization: resource_tracker unregister failed: {exc}")
         self._sharedE = numpy.ndarray(
             E_ref.shape, dtype=E_ref.dtype, buffer=self._shm.buf
         )
+        log.info("setupVisualization: shared memory created OK")
 
         # Create default probe transform if none exists
         probe = slicer.mrmlScene.GetFirstNodeByName("TMS Probe")
@@ -1015,6 +1090,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
 
         Uses graceful terminate() → waitForFinished() → kill() escalation.
         """
+        log.info("stopService: begin teardown")
         if self._probeNode is not None and self._probeObsTag is not None:
             self._probeNode.RemoveObserver(self._probeObsTag)
             self._probeObsTag = None
@@ -1050,6 +1126,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
 
         self._cleanupSharedMemory()
         self._port = None
+        log.info("stopService: teardown complete")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1061,11 +1138,13 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         try:
             node.GetMatrixTransformToParent(self._probeMatrix)
             mat = slicer.util.arrayFromVTKMatrix(self._probeMatrix)
+            pos = mat[:3, 3]
+            log.debug(f"probe moved: pos=[{pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}]")
             self._tms.root.update_E_field(mat.tolist())
             self._tms.root.copy_E_to_share(self._shmName)
             self._updateMeshColors()
         except Exception as exc:
-            print(f"[SlicerTMS] updateEField error: {exc}")
+            log.error(f"updateEField error: {exc}", exc_info=True)
 
     def _updateMeshColors(self):
         eArray = slicer.util.arrayFromModelCellData(self._meshNode, "Enorm")
