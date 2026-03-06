@@ -547,6 +547,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         self._probeObsTag  = None   # observer tag
         self._probeMatrix  = vtk.vtkMatrix4x4()
         self._surfaceCellMap = None  # maps surface triangle → original tet index
+        self._internalSurface = None  # cached surface polydata from vtkDataSetMapper
         # QProcess signal slots (stored to prevent GC)
         self._onStateChangedSlot = None
         self._onReadyReadOutSlot = None
@@ -791,7 +792,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
 
         nodes_mm = nodes_m * 1000.0  # metres → mm for VTK / Slicer
 
-        # --- Build temporary VTK unstructured grid for surface extraction ---
+        # --- Build VTK unstructured grid ---
         meshGrid = vtk.vtkUnstructuredGrid()
 
         pts = vtk.vtkPoints()
@@ -810,7 +811,6 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         )
         meshGrid.SetCells(vtk.VTK_TETRA, cells)
 
-        # Attach cell data to the UG so it propagates through the filter
         eArr = vtk.vtkDoubleArray()
         eArr.SetName("Enorm")
         eArr.SetNumberOfValues(nCells)
@@ -830,31 +830,31 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             vtk.util.numpy_support.vtk_to_numpy(tagArr)[:] = tag1
             meshGrid.GetCellData().AddArray(tagArr)
 
-        # --- Extract surface polydata (one-time cost ~8 s for 4.4 M tets) ---
-        log.info("loadMeshToScene: extracting surface ...")
-        surfaceFilter = vtk.vtkGeometryFilter()
-        surfaceFilter.SetInputData(meshGrid)
-        surfaceFilter.PassThroughCellIdsOn()
-        surfaceFilter.Update()
-        surface = surfaceFilter.GetOutput()
+        # Cell-index array: propagated through vtkDataSetMapper's surface
+        # extraction so we can build the surface→tet cell map after the
+        # first render without a separate extraction pass.
+        origIdArr = vtk.vtkIntArray()
+        origIdArr.SetName("_OrigCellIds")
+        origIdArr.SetNumberOfValues(nCells)
+        vtk.util.numpy_support.vtk_to_numpy(origIdArr)[:] = numpy.arange(
+            nCells, dtype=numpy.int32
+        )
+        meshGrid.GetCellData().AddArray(origIdArr)
 
-        origIds = surface.GetCellData().GetArray("vtkOriginalCellIds")
-        self._surfaceCellMap = vtk.util.numpy_support.vtk_to_numpy(origIds).copy()
-        # Remove the bookkeeping array — not needed for display
-        surface.GetCellData().RemoveArray("vtkOriginalCellIds")
-
-        nSurface = surface.GetNumberOfCells()
-        log.info(f"loadMeshToScene: {nCells} tets → {nSurface} surface triangles")
+        log.info(f"loadMeshToScene: {nCells} tets, {len(nodes_mm)} points")
 
         # --- Create or reuse Slicer model node (hidden until E-field ready) ---
+        # Using SetAndObserveMesh (UG) so clipping/thresholding can expose
+        # internal tet faces.  Scalar updates bypass re-extraction by writing
+        # directly to the vtkDataSetMapper's cached surface polydata.
         existing = slicer.mrmlScene.GetFirstNodeByName("TMS E-field")
         if existing and existing.IsA("vtkMRMLModelNode"):
             modelNode = existing
-            modelNode.SetAndObservePolyData(surface)
+            modelNode.SetAndObserveMesh(meshGrid)
         else:
             modelNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
             modelNode.SetName("TMS E-field")
-            modelNode.SetAndObservePolyData(surface)
+            modelNode.SetAndObserveMesh(meshGrid)
             modelNode.CreateDefaultDisplayNodes()
 
         # Configure display but keep hidden — visibility enabled when E-field arrives
@@ -1103,24 +1103,20 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             eArr.SetNumberOfValues(nCells)
             meshGrid.GetCellData().AddArray(eArr)
 
-            # Extract surface polydata
-            log.info("setupVisualization: extracting surface ...")
-            surfaceFilter = vtk.vtkGeometryFilter()
-            surfaceFilter.SetInputData(meshGrid)
-            surfaceFilter.PassThroughCellIdsOn()
-            surfaceFilter.Update()
-            surface = surfaceFilter.GetOutput()
+            # Cell-index array for building surface→tet map after first render
+            origIdArr = vtk.vtkIntArray()
+            origIdArr.SetName("_OrigCellIds")
+            origIdArr.SetNumberOfValues(nCells)
+            vtk.util.numpy_support.vtk_to_numpy(origIdArr)[:] = numpy.arange(
+                nCells, dtype=numpy.int32
+            )
+            meshGrid.GetCellData().AddArray(origIdArr)
 
-            origIds = surface.GetCellData().GetArray("vtkOriginalCellIds")
-            self._surfaceCellMap = vtk.util.numpy_support.vtk_to_numpy(origIds).copy()
-            surface.GetCellData().RemoveArray("vtkOriginalCellIds")
-
-            log.info(f"setupVisualization: {nCells} tets → "
-                     f"{surface.GetNumberOfCells()} surface triangles")
+            log.info(f"setupVisualization: building UG with {nCells} tets")
 
             self._meshNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
             self._meshNode.SetName("TMS E-field")
-            self._meshNode.SetAndObservePolyData(surface)
+            self._meshNode.SetAndObserveMesh(meshGrid)
             self._meshNode.CreateDefaultDisplayNodes()
 
         log.info(f"setupVisualization: mesh node "
@@ -1242,6 +1238,8 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             self._process = None
 
         self._cleanupSharedMemory()
+        self._internalSurface = None
+        self._surfaceCellMap = None
         self._port = None
         log.info("stopService: teardown complete")
 
@@ -1263,16 +1261,70 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             log.error(f"updateEField error: {exc}", exc_info=True)
 
     def _updateMeshColors(self):
-        eArray = slicer.util.arrayFromModelCellData(self._meshNode, "Enorm")
-        if self._surfaceCellMap is not None:
-            eArray[:] = self._sharedEnorm[self._surfaceCellMap]
-        else:
-            eArray[:] = self._sharedEnorm
-        slicer.util.arrayFromModelCellDataModified(self._meshNode, "Enorm")
         dn = self._meshNode.GetDisplayNode()
+
+        if self._internalSurface is not None:
+            # Fast path: write scalars directly to the cached surface
+            # polydata inside vtkDataSetMapper (~5 ms, no re-extraction).
+            surfEnorm = self._internalSurface.GetCellData().GetArray("Enorm")
+            numpy.copyto(
+                vtk.util.numpy_support.vtk_to_numpy(surfEnorm),
+                self._sharedEnorm[self._surfaceCellMap],
+            )
+            surfEnorm.Modified()
+            dn.Modified()
+            return
+
+        # First call — update the UG's scalars (triggers one slow
+        # vtkDataSetMapper extraction on the next render) then cache
+        # the internal surface polydata for subsequent fast updates.
         if not dn.GetVisibility():
             dn.SetVisibility(True)
+
+        eArray = slicer.util.arrayFromModelCellData(self._meshNode, "Enorm")
+        eArray[:] = self._sharedEnorm
+        slicer.util.arrayFromModelCellDataModified(self._meshNode, "Enorm")
         dn.Modified()
+
+        # Force a synchronous render so the vtkDataSetMapper extracts the
+        # surface and we can cache it immediately.
+        threeDView = slicer.app.layoutManager().threeDWidget(0).threeDView()
+        threeDView.renderWindow().Render()
+
+        self._cacheInternalSurface()
+
+    def _cacheInternalSurface(self):
+        """Cache the surface polydata inside vtkDataSetMapper after first render.
+
+        Subsequent scalar updates write directly to this surface, bypassing
+        the expensive surface re-extraction (~8 s on VTK 9.5, ~0.2 s on 9.6).
+        """
+        rw = slicer.app.layoutManager().threeDWidget(0).threeDView().renderWindow()
+        ren = rw.GetRenderers().GetFirstRenderer()
+        actors = ren.GetActors()
+        actors.InitTraversal()
+        for _ in range(actors.GetNumberOfItems()):
+            actor = actors.GetNextActor()
+            mapper = actor.GetMapper()
+            if mapper is None or mapper.GetClassName() != "vtkDataSetMapper":
+                continue
+            pdm = mapper.GetPolyDataMapper()
+            surface = pdm.GetInput()
+            if surface is None or surface.GetNumberOfCells() == 0:
+                continue
+            origIds = surface.GetCellData().GetArray("_OrigCellIds")
+            if origIds is None:
+                continue
+            self._surfaceCellMap = vtk.util.numpy_support.vtk_to_numpy(
+                origIds
+            ).copy()
+            self._internalSurface = surface
+            log.info(
+                f"Cached internal surface: {surface.GetNumberOfCells()} "
+                f"triangles (fast scalar path active)"
+            )
+            return
+        log.warning("Could not cache internal surface — using slow path")
 
     def _cleanupSharedMemory(self):
         self._sharedEnorm = None
