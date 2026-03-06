@@ -242,7 +242,6 @@ class TMSService(rpyc.SlaveService):
         self._solve_loop()
 
     def _solve_loop(self):
-        import time as _time
         from tmswarp.coil import magnetic_dipole_dadt
         from tmswarp.fields import compute_efield_at_elements
 
@@ -259,23 +258,13 @@ class TMSService(rpyc.SlaveService):
         while True:
             if self._converged or self._dAdt is None:
                 # Nothing to compute — block on stdin until new input
-                t_wait = _time.perf_counter()
                 line = sys.stdin.readline().strip()
-                t_read = _time.perf_counter()
                 if not line or line == "STOP":
                     break
                 latest = self._drain_stdin_keep_latest(line)
                 if latest == "STOP":
                     break
-                t_drain = _time.perf_counter()
                 self._apply_probe(latest, magnetic_dipole_dadt)
-                t_probe = _time.perf_counter()
-                print(
-                    f"TIMING readline={t_read-t_wait:.3f}s "
-                    f"drain={t_drain-t_read:.3f}s "
-                    f"apply_probe={t_probe-t_drain:.3f}s"
-                )
-                sys.stdout.flush()
                 if self._solver == "numpy":
                     self._solve_numpy_and_emit(compute_efield_at_elements)
                     continue
@@ -285,31 +274,22 @@ class TMSService(rpyc.SlaveService):
             if latest is not None:
                 if latest == "STOP":
                     break
-                t0 = _time.perf_counter()
                 self._apply_probe(latest, magnetic_dipole_dadt)
-                t1 = _time.perf_counter()
-                print(f"TIMING mid_apply_probe={t1-t0:.3f}s")
-                sys.stdout.flush()
                 if self._solver == "numpy":
                     self._solve_numpy_and_emit(compute_efield_at_elements)
                     continue
 
             # Warp CG: run one chunk of iterations
             if self._solver in ("warp_cpu", "warp_gpu") and not self._converged:
-                t0 = _time.perf_counter()
                 err, iters, converged = self._warp_ctx.step(n_iters=50)
-                t1 = _time.perf_counter()
                 enorm = self._warp_ctx.compute_enorm()
-                t2 = _time.perf_counter()
                 if self._sharedEnorm is not None:
                     self._sharedEnorm[:] = enorm
-                t3 = _time.perf_counter()
                 self._converged = converged
                 print(
                     f"E_UPDATED iter={iters} "
                     f"residual={err:.6e} "
-                    f"converged={int(converged)} "
-                    f"step={t1-t0:.3f}s enorm={t2-t1:.3f}s shm={t3-t2:.3f}s"
+                    f"converged={int(converged)}"
                 )
                 sys.stdout.flush()
 
@@ -338,10 +318,8 @@ class TMSService(rpyc.SlaveService):
 
     def _apply_probe(self, line, magnetic_dipole_dadt):
         """Parse a PROBE line, compute dAdt, set new RHS, reset convergence."""
-        import time as _time
         if not line.startswith("PROBE"):
             return
-        t0 = _time.perf_counter()
         floats = [float(x) for x in line.split()[1:]]
         mat = np.array(floats, dtype=np.float64).reshape(4, 4)
 
@@ -351,19 +329,14 @@ class TMSService(rpyc.SlaveService):
         if norm > 1e-12:
             dipole_moment = dipole_moment / norm
 
-        t1 = _time.perf_counter()
         dAdt = magnetic_dipole_dadt(
             dipole_pos_m, dipole_moment, DIDT, self.mesh.nodes
         )
-        t2 = _time.perf_counter()
         self._dAdt = dAdt
         self._converged = False
 
         if self._solver in ("warp_cpu", "warp_gpu") and self._warp_ctx is not None:
             self._warp_ctx.set_rhs(dAdt)
-            t3 = _time.perf_counter()
-            print(f"TIMING parse={t1-t0:.3f}s dAdt={t2-t1:.3f}s set_rhs={t3-t2:.3f}s")
-            sys.stdout.flush()
 
     def _solve_numpy_and_emit(self, compute_efield_at_elements):
         """Full numpy backsubstitution, write to shared memory, emit notification."""

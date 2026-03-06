@@ -546,6 +546,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         self._probeNode    = None   # vtkMRMLLinearTransformNode
         self._probeObsTag  = None   # observer tag
         self._probeMatrix  = vtk.vtkMatrix4x4()
+        self._surfaceCellMap = None  # maps surface triangle → original tet index
         # QProcess signal slots (stored to prevent GC)
         self._onStateChangedSlot = None
         self._onReadyReadOutSlot = None
@@ -786,10 +787,11 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         elements     = data["elements"]
         conductivity = data["conductivity"]
         tag1         = data["tag1"] if "tag1" in data else None
+        nCells       = elements.shape[0]
 
         nodes_mm = nodes_m * 1000.0  # metres → mm for VTK / Slicer
 
-        # --- Build VTK unstructured tetrahedral grid ---
+        # --- Build temporary VTK unstructured grid for surface extraction ---
         meshGrid = vtk.vtkUnstructuredGrid()
 
         pts = vtk.vtkPoints()
@@ -797,7 +799,6 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         vtk.util.numpy_support.vtk_to_numpy(pts.GetData())[:] = nodes_mm
         meshGrid.SetPoints(pts)
 
-        nCells = elements.shape[0]
         offsets = numpy.arange(0, nCells * 4 + 1, 4, dtype=numpy.int64)
         connectivity = numpy.ascontiguousarray(
             elements.ravel(), dtype=numpy.int64
@@ -809,7 +810,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         )
         meshGrid.SetCells(vtk.VTK_TETRA, cells)
 
-        # --- Cell-data scalar arrays ---
+        # Attach cell data to the UG so it propagates through the filter
         eArr = vtk.vtkDoubleArray()
         eArr.SetName("Enorm")
         eArr.SetNumberOfValues(nCells)
@@ -829,21 +830,34 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             vtk.util.numpy_support.vtk_to_numpy(tagArr)[:] = tag1
             meshGrid.GetCellData().AddArray(tagArr)
 
+        # --- Extract surface polydata (one-time cost ~8 s for 4.4 M tets) ---
+        log.info("loadMeshToScene: extracting surface ...")
+        surfaceFilter = vtk.vtkGeometryFilter()
+        surfaceFilter.SetInputData(meshGrid)
+        surfaceFilter.PassThroughCellIdsOn()
+        surfaceFilter.Update()
+        surface = surfaceFilter.GetOutput()
+
+        origIds = surface.GetCellData().GetArray("vtkOriginalCellIds")
+        self._surfaceCellMap = vtk.util.numpy_support.vtk_to_numpy(origIds).copy()
+        # Remove the bookkeeping array — not needed for display
+        surface.GetCellData().RemoveArray("vtkOriginalCellIds")
+
+        nSurface = surface.GetNumberOfCells()
+        log.info(f"loadMeshToScene: {nCells} tets → {nSurface} surface triangles")
+
         # --- Create or reuse Slicer model node (hidden until E-field ready) ---
         existing = slicer.mrmlScene.GetFirstNodeByName("TMS E-field")
         if existing and existing.IsA("vtkMRMLModelNode"):
             modelNode = existing
-            modelNode.SetAndObserveMesh(meshGrid)
+            modelNode.SetAndObservePolyData(surface)
         else:
             modelNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
             modelNode.SetName("TMS E-field")
-            modelNode.SetAndObserveMesh(meshGrid)
+            modelNode.SetAndObservePolyData(surface)
             modelNode.CreateDefaultDisplayNodes()
 
-        log.info(f"loadMeshToScene: {nCells} cells, {len(nodes_mm)} points")
-
-        # Configure display but keep hidden — avoids 8s vtkDataSetMapper
-        # surface extraction.  Visibility is enabled when E-field arrives.
+        # Configure display but keep hidden — visibility enabled when E-field arrives
         dn = modelNode.GetDisplayNode()
         dn.SetVisibility(False)
         dn.SetAndObserveColorNodeID("vtkMRMLColorTableNodeFileViridis.txt")
@@ -932,27 +946,18 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             log.warning(f"TMSService error: {err}")
 
     def _onReadyReadStdout(self):
-        import time as _time
         if self._process is None:
             return
-        t0 = _time.perf_counter()
         data = self._process.readAllStandardOutput()
         if data:
             needs_update = False
-            lines = data.data().decode("utf-8", errors="replace").rstrip("\n").split("\n")
-            for line in lines:
+            for line in data.data().decode("utf-8", errors="replace").rstrip("\n").split("\n"):
                 log.info(f"[TMSService] {line}")
                 if (line.startswith("E_UPDATED") or line.startswith("STREAMING_READY")) \
                         and self._sharedEnorm is not None:
                     needs_update = True
             if needs_update:
-                t1 = _time.perf_counter()
                 self._updateMeshColors()
-                t2 = _time.perf_counter()
-                log.info(
-                    f"TIMING stdout_handler: {len(lines)} lines, "
-                    f"parse={t1-t0:.3f}s render={t2-t1:.3f}s total={t2-t0:.3f}s"
-                )
 
     def _onReadyReadStderr(self):
         if self._process is None:
@@ -1083,7 +1088,6 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             vtk.util.numpy_support.vtk_to_numpy(pts.GetData())[:] = nodes_mm
             meshGrid.SetPoints(pts)
 
-            # VTK 9.5 requires int64 connectivity
             nCells = elements.shape[0]
             offsets = numpy.arange(0, nCells * 4 + 1, 4, dtype=numpy.int64)
             connectivity = elements.ravel().astype(numpy.int64)
@@ -1099,12 +1103,27 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             eArr.SetNumberOfValues(nCells)
             meshGrid.GetCellData().AddArray(eArr)
 
+            # Extract surface polydata
+            log.info("setupVisualization: extracting surface ...")
+            surfaceFilter = vtk.vtkGeometryFilter()
+            surfaceFilter.SetInputData(meshGrid)
+            surfaceFilter.PassThroughCellIdsOn()
+            surfaceFilter.Update()
+            surface = surfaceFilter.GetOutput()
+
+            origIds = surface.GetCellData().GetArray("vtkOriginalCellIds")
+            self._surfaceCellMap = vtk.util.numpy_support.vtk_to_numpy(origIds).copy()
+            surface.GetCellData().RemoveArray("vtkOriginalCellIds")
+
+            log.info(f"setupVisualization: {nCells} tets → "
+                     f"{surface.GetNumberOfCells()} surface triangles")
+
             self._meshNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
             self._meshNode.SetName("TMS E-field")
-            self._meshNode.SetAndObserveMesh(meshGrid)
+            self._meshNode.SetAndObservePolyData(surface)
             self._meshNode.CreateDefaultDisplayNodes()
 
-        log.info(f"setupVisualization: reusing existing mesh node "
+        log.info(f"setupVisualization: mesh node "
                  f"({self._meshNode.GetMesh().GetNumberOfCells()} cells)"
                  if self._meshNode and self._meshNode.GetMesh()
                     and self._meshNode.GetMesh().GetNumberOfCells() > 0
@@ -1125,12 +1144,11 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         )
         log.info("setupVisualization: shared memory created OK")
 
-        # Switch display to Enorm (from conductivity if loadMeshToScene ran earlier)
+        # Ensure display is configured for Enorm (visibility deferred to first update)
         dn = self._meshNode.GetDisplayNode()
         dn.SetAndObserveColorNodeID("vtkMRMLColorTableNodeFileViridis.txt")
         dn.SetActiveScalar("Enorm", vtk.vtkAssignAttribute.CELL_DATA)
         dn.SetScalarVisibility(True)
-        dn.Modified()
 
         # Start streaming solve loop (non-blocking — runs in service process)
         import rpyc
@@ -1229,24 +1247,24 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
     # ------------------------------------------------------------------
 
     def _onProbeTransformModified(self, node, event):
-        import time as _time
         if self._process is None or self._meshNode is None:
             return
         try:
-            t0 = _time.perf_counter()
             node.GetMatrixTransformToParent(self._probeMatrix)
             mat = slicer.util.arrayFromVTKMatrix(self._probeMatrix)
             pos = mat[:3, 3]
             vals = " ".join(f"{v:.6f}" for v in mat.ravel())
             self._process.write(f"PROBE {vals}\n".encode("utf-8"))
-            t1 = _time.perf_counter()
-            log.debug(f"probe moved: pos=[{pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}] write={t1-t0:.3f}s")
+            log.debug(f"probe moved: pos=[{pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}]")
         except Exception as exc:
             log.error(f"updateEField error: {exc}", exc_info=True)
 
     def _updateMeshColors(self):
         eArray = slicer.util.arrayFromModelCellData(self._meshNode, "Enorm")
-        eArray[:] = self._sharedEnorm
+        if self._surfaceCellMap is not None:
+            eArray[:] = self._sharedEnorm[self._surfaceCellMap]
+        else:
+            eArray[:] = self._sharedEnorm
         slicer.util.arrayFromModelCellDataModified(self._meshNode, "Enorm")
         dn = self._meshNode.GetDisplayNode()
         if not dn.GetVisibility():
