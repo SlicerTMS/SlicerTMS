@@ -542,11 +542,11 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         self._sharedEnorm  = None   # numpy view into shared memory (scalar |E|)
         self._shmName      = f"tmsSharedE_{os.getpid()}_{id(self):x}"
         self._port         = None   # port used by current service
-        self._meshNode     = None   # vtkMRMLModelNode for E-field display
+        self._meshNode     = None   # primary vtkMRMLModelNode (brain)
+        self._tissueModels = []    # [{"node", "cellMap", "tag"}] per tissue
         self._probeNode    = None   # vtkMRMLLinearTransformNode
         self._probeObsTag  = None   # observer tag
         self._probeMatrix  = vtk.vtkMatrix4x4()
-        self._surfaceCellMap = None  # maps surface triangle → original tet index
         # QProcess signal slots (stored to prevent GC)
         self._onStateChangedSlot = None
         self._onReadyReadOutSlot = None
@@ -791,7 +791,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
 
         nodes_mm = nodes_m * 1000.0  # metres → mm for VTK / Slicer
 
-        # --- Build temporary VTK unstructured grid for surface extraction ---
+        # --- Build VTK unstructured grid ---
         meshGrid = vtk.vtkUnstructuredGrid()
 
         pts = vtk.vtkPoints()
@@ -810,7 +810,6 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         )
         meshGrid.SetCells(vtk.VTK_TETRA, cells)
 
-        # Attach cell data to the UG so it propagates through the filter
         eArr = vtk.vtkDoubleArray()
         eArr.SetName("Enorm")
         eArr.SetNumberOfValues(nCells)
@@ -830,43 +829,135 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             vtk.util.numpy_support.vtk_to_numpy(tagArr)[:] = tag1
             meshGrid.GetCellData().AddArray(tagArr)
 
-        # --- Extract surface polydata (one-time cost ~8 s for 4.4 M tets) ---
-        log.info("loadMeshToScene: extracting surface ...")
-        surfaceFilter = vtk.vtkGeometryFilter()
-        surfaceFilter.SetInputData(meshGrid)
-        surfaceFilter.PassThroughCellIdsOn()
-        surfaceFilter.Update()
-        surface = surfaceFilter.GetOutput()
+        # --- Extract tissue boundary surfaces ---
+        # Remove any previous tissue models
+        self._removeTissueModels()
+
+        if tag1 is not None:
+            self._extractTissueSurfaces(meshGrid, tag1)
+        else:
+            self._extractOuterSurface(meshGrid)
+
+        log.info(f"loadMeshToScene: {nCells} tets, "
+                 f"{len(self._tissueModels)} tissue models")
+        return self._meshNode
+
+    # Tissue tag → display config.  SimNIBS v4 splits skull into compact
+    # (7) and spongy (8) bone; v3 uses tag 4 for combined skull.
+    TISSUE_DISPLAY = {
+        2:  {"name": "Brain (GM)",     "opacity": 1.0},
+        1:  {"name": "White Matter",   "opacity": 0.3},
+        3:  {"name": "CSF",            "opacity": 0.05},
+        4:  {"name": "Skull",          "opacity": 0.12},
+        5:  {"name": "Scalp",          "opacity": 0.1},
+        6:  {"name": "Eye",            "opacity": 0.08},
+        7:  {"name": "Compact Bone",   "opacity": 0.12},
+        8:  {"name": "Spongy Bone",    "opacity": 0.12},
+    }
+
+    def _extractTissueSurfaces(self, meshGrid, tag1):
+        """Extract boundary surfaces per tissue type from the UG.
+
+        For each unique tag value, threshold the UG, extract the surface
+        with vtkGeometryFilter (threaded), and create a model node with
+        tissue-specific opacity.  Stores results in self._tissueModels.
+        """
+        unique_tags = sorted(numpy.unique(tag1))
+        for tag in unique_tags:
+            cfg = self.TISSUE_DISPLAY.get(
+                int(tag), {"name": f"Tissue {tag}", "opacity": 0.05}
+            )
+
+            thresh = vtk.vtkThreshold()
+            thresh.SetInputData(meshGrid)
+            thresh.SetInputArrayToProcess(
+                0, 0, 0,
+                vtk.vtkDataObject.FIELD_ASSOCIATION_CELLS, "tag1"
+            )
+            thresh.SetThresholdFunction(vtk.vtkThreshold.THRESHOLD_BETWEEN)
+            thresh.SetLowerThreshold(tag)
+            thresh.SetUpperThreshold(tag)
+            thresh.Update()
+
+            gf = vtk.vtkGeometryFilter()
+            gf.SetInputConnection(thresh.GetOutputPort())
+            gf.PassThroughCellIdsOn()
+            gf.Update()
+            surface = gf.GetOutput()
+
+            if surface.GetNumberOfCells() == 0:
+                continue
+
+            origIds = surface.GetCellData().GetArray("vtkOriginalCellIds")
+            cellMap = vtk.util.numpy_support.vtk_to_numpy(origIds).copy()
+            surface.GetCellData().RemoveArray("vtkOriginalCellIds")
+
+            name = f"TMS E-field - {cfg['name']}"
+            node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
+            node.SetName(name)
+            node.SetAndObservePolyData(surface)
+            node.CreateDefaultDisplayNodes()
+
+            dn = node.GetDisplayNode()
+            dn.SetVisibility(False)
+            dn.SetAndObserveColorNodeID(
+                "vtkMRMLColorTableNodeFileViridis.txt"
+            )
+            dn.SetActiveScalar("Enorm", vtk.vtkAssignAttribute.CELL_DATA)
+            dn.SetScalarVisibility(True)
+            dn.SetAutoScalarRange(True)
+            dn.SetOpacity(cfg["opacity"])
+
+            self._tissueModels.append({
+                "node": node, "cellMap": cellMap, "tag": int(tag),
+            })
+            log.info(f"  tag={tag} ({cfg['name']}): "
+                     f"{surface.GetNumberOfCells()} faces, "
+                     f"opacity={cfg['opacity']}")
+
+        # Primary mesh node = brain (GM, tag 2) if available, else first
+        brain = [m for m in self._tissueModels if m["tag"] == 2]
+        self._meshNode = brain[0]["node"] if brain else (
+            self._tissueModels[0]["node"] if self._tissueModels else None
+        )
+
+    def _extractOuterSurface(self, meshGrid):
+        """Fallback: extract just the outer surface when tag1 is unavailable."""
+        nCells = meshGrid.GetNumberOfCells()
+        gf = vtk.vtkGeometryFilter()
+        gf.SetInputData(meshGrid)
+        gf.PassThroughCellIdsOn()
+        gf.Update()
+        surface = gf.GetOutput()
 
         origIds = surface.GetCellData().GetArray("vtkOriginalCellIds")
-        self._surfaceCellMap = vtk.util.numpy_support.vtk_to_numpy(origIds).copy()
-        # Remove the bookkeeping array — not needed for display
+        cellMap = vtk.util.numpy_support.vtk_to_numpy(origIds).copy()
         surface.GetCellData().RemoveArray("vtkOriginalCellIds")
 
-        nSurface = surface.GetNumberOfCells()
-        log.info(f"loadMeshToScene: {nCells} tets → {nSurface} surface triangles")
+        node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
+        node.SetName("TMS E-field")
+        node.SetAndObservePolyData(surface)
+        node.CreateDefaultDisplayNodes()
 
-        # --- Create or reuse Slicer model node (hidden until E-field ready) ---
-        existing = slicer.mrmlScene.GetFirstNodeByName("TMS E-field")
-        if existing and existing.IsA("vtkMRMLModelNode"):
-            modelNode = existing
-            modelNode.SetAndObservePolyData(surface)
-        else:
-            modelNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
-            modelNode.SetName("TMS E-field")
-            modelNode.SetAndObservePolyData(surface)
-            modelNode.CreateDefaultDisplayNodes()
-
-        # Configure display but keep hidden — visibility enabled when E-field arrives
-        dn = modelNode.GetDisplayNode()
+        dn = node.GetDisplayNode()
         dn.SetVisibility(False)
         dn.SetAndObserveColorNodeID("vtkMRMLColorTableNodeFileViridis.txt")
         dn.SetActiveScalar("Enorm", vtk.vtkAssignAttribute.CELL_DATA)
         dn.SetScalarVisibility(True)
         dn.SetAutoScalarRange(True)
 
-        self._meshNode = modelNode
-        return modelNode
+        self._tissueModels.append({"node": node, "cellMap": cellMap, "tag": 0})
+        self._meshNode = node
+
+        log.info(f"  outer surface: {surface.GetNumberOfCells()} faces")
+
+    def _removeTissueModels(self):
+        """Remove all tissue model nodes from the scene."""
+        for m in self._tissueModels:
+            if m["node"] is not None:
+                slicer.mrmlScene.RemoveNode(m["node"])
+        self._tissueModels = []
+        self._meshNode = None
 
     # ------------------------------------------------------------------
     # Service lifecycle
@@ -1073,11 +1164,9 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         n_elements = int(self._tms.root.n_elements)
         log.info(f"setupVisualization: n_elements={n_elements}")
 
-        # Reuse existing mesh node if loadMeshToScene() was called earlier;
-        # otherwise build from service data (backward compat / direct start).
-        if (self._meshNode is None
-                or self._meshNode.GetMesh() is None
-                or self._meshNode.GetMesh().GetNumberOfCells() == 0):
+        # Reuse existing tissue models if loadMeshToScene() was called earlier;
+        # otherwise build the grid from service data (backward compat).
+        if not self._tissueModels:
             log.info("setupVisualization: building grid from service data (no prior mesh)")
             nodes_mm = numpy.array(self._tms.root.nodes_mm)
             elements = numpy.array(self._tms.root.elements)
@@ -1103,31 +1192,9 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             eArr.SetNumberOfValues(nCells)
             meshGrid.GetCellData().AddArray(eArr)
 
-            # Extract surface polydata
-            log.info("setupVisualization: extracting surface ...")
-            surfaceFilter = vtk.vtkGeometryFilter()
-            surfaceFilter.SetInputData(meshGrid)
-            surfaceFilter.PassThroughCellIdsOn()
-            surfaceFilter.Update()
-            surface = surfaceFilter.GetOutput()
+            self._extractOuterSurface(meshGrid)
 
-            origIds = surface.GetCellData().GetArray("vtkOriginalCellIds")
-            self._surfaceCellMap = vtk.util.numpy_support.vtk_to_numpy(origIds).copy()
-            surface.GetCellData().RemoveArray("vtkOriginalCellIds")
-
-            log.info(f"setupVisualization: {nCells} tets → "
-                     f"{surface.GetNumberOfCells()} surface triangles")
-
-            self._meshNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
-            self._meshNode.SetName("TMS E-field")
-            self._meshNode.SetAndObservePolyData(surface)
-            self._meshNode.CreateDefaultDisplayNodes()
-
-        log.info(f"setupVisualization: mesh node "
-                 f"({self._meshNode.GetMesh().GetNumberOfCells()} cells)"
-                 if self._meshNode and self._meshNode.GetMesh()
-                    and self._meshNode.GetMesh().GetNumberOfCells() > 0
-                 else "setupVisualization: mesh node ready")
+        log.info(f"setupVisualization: {len(self._tissueModels)} tissue model(s)")
 
         # Shared memory for scalar Enorm streaming (avoids RPyC serialisation)
         _fix_spawn_executable()
@@ -1143,12 +1210,6 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             (n_elements,), dtype=numpy.float64, buffer=self._shm.buf
         )
         log.info("setupVisualization: shared memory created OK")
-
-        # Ensure display is configured for Enorm (visibility deferred to first update)
-        dn = self._meshNode.GetDisplayNode()
-        dn.SetAndObserveColorNodeID("vtkMRMLColorTableNodeFileViridis.txt")
-        dn.SetActiveScalar("Enorm", vtk.vtkAssignAttribute.CELL_DATA)
-        dn.SetScalarVisibility(True)
 
         # Start streaming solve loop (non-blocking — runs in service process)
         import rpyc
@@ -1263,16 +1324,16 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             log.error(f"updateEField error: {exc}", exc_info=True)
 
     def _updateMeshColors(self):
-        eArray = slicer.util.arrayFromModelCellData(self._meshNode, "Enorm")
-        if self._surfaceCellMap is not None:
-            eArray[:] = self._sharedEnorm[self._surfaceCellMap]
-        else:
-            eArray[:] = self._sharedEnorm
-        slicer.util.arrayFromModelCellDataModified(self._meshNode, "Enorm")
-        dn = self._meshNode.GetDisplayNode()
-        if not dn.GetVisibility():
-            dn.SetVisibility(True)
-        dn.Modified()
+        for m in self._tissueModels:
+            node = m["node"]
+            cellMap = m["cellMap"]
+            eArray = slicer.util.arrayFromModelCellData(node, "Enorm")
+            eArray[:] = self._sharedEnorm[cellMap]
+            slicer.util.arrayFromModelCellDataModified(node, "Enorm")
+            dn = node.GetDisplayNode()
+            if not dn.GetVisibility():
+                dn.SetVisibility(True)
+            dn.Modified()
 
     def _cleanupSharedMemory(self):
         self._sharedEnorm = None
