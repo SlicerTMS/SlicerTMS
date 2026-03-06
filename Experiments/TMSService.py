@@ -69,8 +69,10 @@ class TMSService(rpyc.SlaveService):
         self._K = None            # assembled stiffness (sparse, unpinned)
         self._K_factor = None     # callable: b_reduced → phi_reduced
         self._dAdt = None         # last dAdt at nodes (N, 3)
-        self._sharedE = None      # numpy view into shared memory
-        self._shm = None          # shared memory block
+        self._sharedE = None      # numpy view into shared memory (vector E)
+        self._sharedEnorm = None  # numpy view into shared memory (scalar |E|)
+        self._shmEnorm = None     # shared memory block for streaming Enorm
+        self._shm = None          # shared memory block (vector E, legacy)
         self._warp_ctx = None     # WarpFEMContext for streaming CG
         self._converged = True    # streaming solve state
 
@@ -191,6 +193,11 @@ class TMSService(rpyc.SlaveService):
             )
         self._sharedE[:] = self.E
 
+    @property
+    def n_elements(self):
+        """Number of mesh elements (for shared memory sizing)."""
+        return len(self.mesh.elements) if self.mesh is not None else 0
+
     # ------------------------------------------------------------------
     # Streaming solve loop (event-driven via stdin/stdout)
     # ------------------------------------------------------------------
@@ -199,14 +206,23 @@ class TMSService(rpyc.SlaveService):
         """Enter the streaming solve loop.
 
         Blocks until STOP is received on stdin.  Probe positions arrive
-        via stdin as ``PROBE <16 floats>`` lines; E-field updates are
+        via stdin as ``PROBE <16 floats>`` lines; |E| (Enorm) updates are
         written to shared memory and signalled via stdout
         ``E_UPDATED iter=N residual=R converged=0|1`` lines.
 
         Called via ``rpyc.async_()`` so the client isn't blocked.
+
+        The shared memory block *share_name* must be sized for
+        ``(n_elements,) float64`` — scalar Enorm per element.
         """
-        # Set up shared memory
-        self.copy_E_to_share(share_name)
+        # Attach to shared memory for scalar Enorm
+        self._shmEnorm = multiprocessing.shared_memory.SharedMemory(
+            name=share_name
+        )
+        n_elem = len(self.mesh.elements)
+        self._sharedEnorm = np.ndarray(
+            (n_elem,), dtype=np.float64, buffer=self._shmEnorm.buf
+        )
         print(f"STREAMING_READY solver={self._solver}")
         sys.stdout.flush()
         self._solve_loop()
@@ -252,12 +268,9 @@ class TMSService(rpyc.SlaveService):
             # Warp CG: run one chunk of iterations
             if self._solver in ("warp_cpu", "warp_gpu") and not self._converged:
                 err, iters, converged = self._warp_ctx.step(n_iters=50)
-                phi = self._warp_ctx.get_phi()
-                self.E = compute_efield_at_elements(
-                    self.mesh, phi, self._dAdt, self._G
-                )
-                if self._sharedE is not None:
-                    self._sharedE[:] = self.E
+                enorm = self._warp_ctx.compute_enorm()
+                if self._sharedEnorm is not None:
+                    self._sharedEnorm[:] = enorm
                 self._converged = converged
                 print(
                     f"E_UPDATED iter={iters} "
@@ -323,8 +336,8 @@ class TMSService(rpyc.SlaveService):
         self.E = compute_efield_at_elements(
             self.mesh, phi, self._dAdt, self._G
         )
-        if self._sharedE is not None:
-            self._sharedE[:] = self.E
+        if self._sharedEnorm is not None:
+            self._sharedEnorm[:] = np.linalg.norm(self.E, axis=1)
         self._converged = True
 
         mag = np.linalg.norm(self.E, axis=1)

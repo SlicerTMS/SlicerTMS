@@ -539,7 +539,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         self._process      = None   # qt.QProcess for TMSService
         self._tms          = None   # RPyC connection
         self._shm          = None   # shared memory block
-        self._sharedE      = None   # numpy view into shared memory
+        self._sharedEnorm  = None   # numpy view into shared memory (scalar |E|)
         self._shmName      = f"tmsSharedE_{os.getpid()}_{id(self):x}"
         self._port         = None   # port used by current service
         self._meshNode     = None   # vtkMRMLModelNode for E-field display
@@ -936,7 +936,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         if data:
             for line in data.data().decode("utf-8", errors="replace").rstrip("\n").split("\n"):
                 log.info(f"[TMSService] {line}")
-                if line.startswith("E_UPDATED") and self._sharedE is not None:
+                if line.startswith("E_UPDATED") and self._sharedEnorm is not None:
                     self._updateMeshColors()
 
     def _onReadyReadStderr(self):
@@ -1050,8 +1050,8 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         if self._tms is None:
             raise RuntimeError("Not connected to TMSService.")
 
-        E_ref = numpy.array(self._tms.root.E)  # (M, 3) — always needed
-        log.info(f"setupVisualization: E_ref shape={E_ref.shape}, dtype={E_ref.dtype}")
+        n_elements = int(self._tms.root.n_elements)
+        log.info(f"setupVisualization: n_elements={n_elements}")
 
         # Reuse existing mesh node if loadMeshToScene() was called earlier;
         # otherwise build from service data (backward compat / direct start).
@@ -1095,17 +1095,18 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
                     and self._meshNode.GetMesh().GetNumberOfCells() > 0
                  else "setupVisualization: mesh node ready")
 
-        # Shared memory for fast E-field streaming (avoids RPyC serialisation)
+        # Shared memory for scalar Enorm streaming (avoids RPyC serialisation)
         _fix_spawn_executable()
         self._cleanupSharedMemory()
         _cleanup_orphaned_shm(self._shmName)
+        enorm_nbytes = n_elements * 8  # float64 scalar per element
         log.info(f"setupVisualization: creating shared memory '{self._shmName}', "
-                 f"size={E_ref.nbytes} bytes")
+                 f"size={enorm_nbytes} bytes ({n_elements} elements)")
         self._shm = multiprocessing.shared_memory.SharedMemory(
-            create=True, size=E_ref.nbytes, name=self._shmName
+            create=True, size=enorm_nbytes, name=self._shmName
         )
-        self._sharedE = numpy.ndarray(
-            E_ref.shape, dtype=E_ref.dtype, buffer=self._shm.buf
+        self._sharedEnorm = numpy.ndarray(
+            (n_elements,), dtype=numpy.float64, buffer=self._shm.buf
         )
         log.info("setupVisualization: shared memory created OK")
 
@@ -1228,12 +1229,12 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
 
     def _updateMeshColors(self):
         eArray = slicer.util.arrayFromModelCellData(self._meshNode, "Enorm")
-        eArray[:] = numpy.linalg.norm(self._sharedE, axis=1)
+        eArray[:] = self._sharedEnorm
         slicer.util.arrayFromModelCellDataModified(self._meshNode, "Enorm")
         self._meshNode.GetDisplayNode().Modified()
 
     def _cleanupSharedMemory(self):
-        self._sharedE = None
+        self._sharedEnorm = None
         if self._shm is not None:
             try:
                 self._shm.close()
