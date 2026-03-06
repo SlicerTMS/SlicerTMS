@@ -75,6 +75,10 @@ class TMSService(rpyc.SlaveService):
         self._shm = None          # shared memory block (vector E, legacy)
         self._warp_ctx = None     # WarpFEMContext for streaming CG
         self._converged = True    # streaming solve state
+        self._tag1 = None         # (M,) int tissue tags, if available
+        self._barycenters = None  # (M, 3) element barycenters (meters)
+        self._elem_weights = None # (M,) sigma*vol per element
+        self._last_probe_mat = None  # last 4x4 probe matrix (for optimization init)
 
     # ------------------------------------------------------------------
     # Public API
@@ -106,6 +110,7 @@ class TMSService(rpyc.SlaveService):
         )
         self.nodes_mm = self.mesh.nodes * 1000.0   # m → mm  (for VTK)
         self.elements = self.mesh.elements          # 0-based int32
+        self._tag1 = data["tag1"].astype(np.int32) if "tag1" in data else None
         print(
             f"  {len(self.mesh.nodes):,} nodes  "
             f"{len(self.mesh.elements):,} elements"
@@ -241,6 +246,29 @@ class TMSService(rpyc.SlaveService):
         sys.stdout.flush()
         self._solve_loop()
 
+    def _handle_command(self, line, magnetic_dipole_dadt, compute_efield_at_elements):
+        """Dispatch a stdin command. Returns 'stop' to exit, 'continue' otherwise."""
+        if line == "STOP" or not line:
+            return "stop"
+        if line.startswith("OPTIMIZE"):
+            parts = line.split()
+            if len(parts) >= 4:
+                target_mm = np.array([float(parts[1]), float(parts[2]),
+                                      float(parts[3])])
+                pending = self._optimize_coil(target_mm)
+                if pending is not None:
+                    # Optimization was interrupted — process the pending cmd
+                    return self._handle_command(
+                        pending, magnetic_dipole_dadt, compute_efield_at_elements
+                    )
+            return "continue"
+        if line.startswith("PROBE"):
+            self._apply_probe(line, magnetic_dipole_dadt)
+            if self._solver == "numpy":
+                self._solve_numpy_and_emit(compute_efield_at_elements)
+            return "continue"
+        return "continue"
+
     def _solve_loop(self):
         from tmswarp.coil import magnetic_dipole_dadt
         from tmswarp.fields import compute_efield_at_elements
@@ -264,20 +292,24 @@ class TMSService(rpyc.SlaveService):
                 latest = self._drain_stdin_keep_latest(line)
                 if latest == "STOP":
                     break
-                self._apply_probe(latest, magnetic_dipole_dadt)
-                if self._solver == "numpy":
-                    self._solve_numpy_and_emit(compute_efield_at_elements)
-                    continue
+                result = self._handle_command(
+                    latest, magnetic_dipole_dadt, compute_efield_at_elements
+                )
+                if result == "stop":
+                    break
+                continue
 
             # Mid-solve: check for new input without blocking
             latest = self._drain_stdin_nonblocking()
             if latest is not None:
                 if latest == "STOP":
                     break
-                self._apply_probe(latest, magnetic_dipole_dadt)
-                if self._solver == "numpy":
-                    self._solve_numpy_and_emit(compute_efield_at_elements)
-                    continue
+                result = self._handle_command(
+                    latest, magnetic_dipole_dadt, compute_efield_at_elements
+                )
+                if result == "stop":
+                    break
+                continue
 
             # Warp CG: run one chunk of iterations
             if self._solver in ("warp_cpu", "warp_gpu") and not self._converged:
@@ -322,6 +354,7 @@ class TMSService(rpyc.SlaveService):
             return
         floats = [float(x) for x in line.split()[1:]]
         mat = np.array(floats, dtype=np.float64).reshape(4, 4)
+        self._last_probe_mat = mat
 
         dipole_pos_m = mat[:3, 3] * 1e-3
         dipole_moment = mat[:3, 2]
@@ -361,6 +394,289 @@ class TMSService(rpyc.SlaveService):
             f"converged=1"
         )
         sys.stdout.flush()
+
+    # ------------------------------------------------------------------
+    # Coil position optimization (adjoint-based)
+    # ------------------------------------------------------------------
+
+    def _find_nearest_element(self, target_m):
+        """Find the brain element nearest to a target point (in meters).
+
+        Restricts to grey matter (tag=2) if tag1 is available.
+        """
+        from tmswarp.conductor import element_barycenters
+
+        if self._barycenters is None:
+            self._barycenters = element_barycenters(self.mesh)
+
+        bary = self._barycenters
+        if self._tag1 is not None:
+            brain_mask = self._tag1 == 2
+            brain_idx = np.nonzero(brain_mask)[0]
+            if len(brain_idx) > 0:
+                dists = np.linalg.norm(bary[brain_idx] - target_m, axis=1)
+                return int(brain_idx[np.argmin(dists)])
+
+        # Fallback: all elements
+        dists = np.linalg.norm(bary - target_m, axis=1)
+        return int(np.argmin(dists))
+
+    def _ensure_elem_weights(self):
+        """Precompute sigma * vol per element (cached)."""
+        if self._elem_weights is None:
+            from tmswarp.conductor import element_volumes
+            vols = element_volumes(self.mesh)
+            self._elem_weights = vols * self.mesh.conductivity
+
+    def _compute_objective_and_gradient(self, params, target_elem):
+        """Compute -|E[target]| and its analytic gradient w.r.t. coil params.
+
+        Parameters
+        ----------
+        params : (6,) array
+            [px, py, pz, mx, my, mz] — position (mm), moment (unnormalized).
+        target_elem : int
+            Element index to maximize |E| at.
+
+        Returns
+        -------
+        loss : float
+            -|E[target]|
+        gradient : (6,) array
+            d(loss)/d(params)
+        """
+        from tmswarp.coil import magnetic_dipole_dadt
+        from tmswarp.solver import assemble_rhs_tms
+
+        self._ensure_elem_weights()
+        w = self._elem_weights
+
+        pos_mm = params[:3]
+        moment_raw = params[3:6]
+        moment_norm = np.linalg.norm(moment_raw)
+        if moment_norm < 1e-12:
+            return 0.0, np.zeros(6)
+        moment = moment_raw / moment_norm
+        pos_m = pos_mm * 1e-3
+
+        nodes = self.mesh.nodes
+        elems = self.mesh.elements
+        G = self._G
+        t = target_elem
+        t_nodes = elems[t]
+
+        # === FORWARD ===
+        dAdt = magnetic_dipole_dadt(pos_m, moment, DIDT, nodes)
+        b = assemble_rhs_tms(self.mesh, dAdt, G)
+        phi = np.zeros(len(nodes), dtype=np.float64)
+        phi[1:] = self._K_factor(b[1:])
+
+        # E at target element
+        phi_t = phi[t_nodes]                          # (4,)
+        G_t = G[t]                                    # (4, 3)
+        grad_phi_t = phi_t @ G_t                      # (3,)
+        dAdt_bary_t = dAdt[t_nodes].mean(axis=0)      # (3,)
+        E_t = -grad_phi_t - dAdt_bary_t               # (3,)
+        Enorm_t = np.linalg.norm(E_t)
+
+        loss = -Enorm_t
+        if Enorm_t < 1e-15:
+            return loss, np.zeros(6)
+
+        # === ADJOINT ===
+        # Step 1: dL/dE
+        dL_dE = -E_t / Enorm_t                        # (3,)
+
+        # Step 2: dL/dphi (sparse — only 4 entries at target nodes)
+        dL_dphi = np.zeros(len(nodes), dtype=np.float64)
+        for i in range(4):
+            dL_dphi[t_nodes[i]] += dL_dE @ (-G_t[i])
+
+        # Step 3: adjoint solve (reuse pre-factored K!)
+        lam = np.zeros(len(nodes), dtype=np.float64)
+        lam[1:] = self._K_factor(dL_dphi[1:])
+
+        # Step 4: dL/d(dAdt_nodes) via b (adjoint contribution)
+        # "Gradient of lambda" at each element
+        lam_elem = lam[elems]                          # (n_elem, 4)
+        lam_grad = np.einsum('ei,eid->ed', lam_elem, G)  # (n_elem, 3)
+
+        # Scatter weighted contributions to nodes
+        dL_dAdt = np.zeros_like(dAdt)                  # (N, 3)
+        weighted_lam_grad = w[:, None] * lam_grad * (-0.25)  # (n_elem, 3)
+        for i in range(4):
+            np.add.at(dL_dAdt, elems[:, i], weighted_lam_grad)
+
+        # Step 5: direct dL/d(dAdt) from E_t
+        for j in t_nodes:
+            dL_dAdt[j] += dL_dE * (-0.25)
+
+        # Step 6: chain rule through Biot-Savart
+        C = 1e-7 * DIDT  # mu0_4pi * didt
+        r = nodes - pos_m                              # (N, 3)
+        r_norm = np.linalg.norm(r, axis=1)[:, None]   # (N, 1)
+        r_norm3 = r_norm ** 3
+        r_norm5 = r_norm ** 5
+
+        # Clamp to avoid division by zero near the dipole
+        r_norm3 = np.maximum(r_norm3, 1e-30)
+        r_norm5 = np.maximum(r_norm5, 1e-30)
+
+        cross_mr = np.cross(moment, r)                 # (N, 3)
+
+        # dL/d(pos_m) — two terms from d/dr[cross(m,r)/|r|^3]
+        # Term 1: -C * cross(m, dL_dAdt) / |r|^3
+        term1 = -C * np.cross(moment, dL_dAdt) / r_norm3
+        # Term 2: +3C * cross(m,r) * (r . dL_dAdt) / |r|^5
+        r_dot_dLdA = np.sum(r * dL_dAdt, axis=1)[:, None]
+        term2 = 3 * C * cross_mr * r_dot_dLdA / r_norm5
+        dL_dpos_m = (term1 + term2).sum(axis=0)
+        dL_dpos_mm = dL_dpos_m * 1e-3  # chain: pos_m = pos_mm * 1e-3
+
+        # dL/d(moment)
+        cross_r_dLdA = np.cross(r, dL_dAdt)           # (N, 3)
+        dL_dmoment = C * (cross_r_dLdA / r_norm3).sum(axis=0)
+
+        # Chain through normalization: m = m_raw / |m_raw|
+        dL_dmoment_raw = (
+            dL_dmoment - moment * np.dot(moment, dL_dmoment)
+        ) / moment_norm
+
+        gradient = np.concatenate([dL_dpos_mm, dL_dmoment_raw])
+        return loss, gradient
+
+    def _params_to_matrix(self, params):
+        """Convert optimization params [px,py,pz,mx,my,mz] to a 4x4 matrix."""
+        pos_mm = params[:3]
+        moment_raw = params[3:6]
+        n = moment_raw / np.linalg.norm(moment_raw)
+
+        # Build orthonormal frame with n as Z
+        ref = np.array([0.0, 0.0, 1.0])
+        if abs(np.dot(n, ref)) > 0.9:
+            ref = np.array([1.0, 0.0, 0.0])
+        x = np.cross(ref, n)
+        x /= np.linalg.norm(x)
+        y = np.cross(n, x)
+
+        mat = np.eye(4, dtype=np.float64)
+        mat[:3, 0] = x
+        mat[:3, 1] = y
+        mat[:3, 2] = n
+        mat[:3, 3] = pos_mm
+        return mat
+
+    def _optimize_coil(self, target_mm):
+        """Run Adam optimization to maximize |E| at the target point.
+
+        Returns a pending stdin command (str) if interrupted, else None.
+        """
+        from tmswarp.coil import magnetic_dipole_dadt
+        from tmswarp.solver import assemble_rhs_tms
+        from tmswarp.fields import compute_efield_at_elements
+
+        # Ensure numpy backend prerequisites
+        if self._K_factor is None or self._G is None:
+            print("OPTIMIZE_ERROR: numpy solver not initialized")
+            sys.stdout.flush()
+            return None
+
+        target_m = np.array(target_mm) * 1e-3
+        target_elem = self._find_nearest_element(target_m)
+        print(f"Optimizing for element {target_elem} "
+              f"(brain tag={self._tag1[target_elem] if self._tag1 is not None else '?'})")
+        sys.stdout.flush()
+
+        # Initialize from current coil state or default
+        if self._dAdt is not None and self._last_probe_mat is not None:
+            mat = self._last_probe_mat
+            pos_mm = mat[:3, 3].copy()
+            moment = mat[:3, 2].copy()
+        else:
+            pos_mm = np.array([0.0, 0.0, 100.0])
+            moment = np.array([0.0, 0.0, 1.0])
+
+        params = np.concatenate([pos_mm, moment])
+
+        # Adam optimizer state
+        lr = 2.0
+        beta1, beta2, eps = 0.9, 0.999, 1e-8
+        m_adam = np.zeros(6)
+        v_adam = np.zeros(6)
+
+        max_iters = 200
+        prev_loss = None
+
+        for iteration in range(max_iters):
+            # Check for interruption
+            cmd = self._drain_stdin_nonblocking()
+            if cmd is not None:
+                if cmd == "STOP":
+                    return "STOP"
+                return cmd  # OPTIMIZE or PROBE — caller handles
+
+            loss, grad = self._compute_objective_and_gradient(params, target_elem)
+
+            # Adam update
+            t_adam = iteration + 1
+            m_adam = beta1 * m_adam + (1 - beta1) * grad
+            v_adam = beta2 * v_adam + (1 - beta2) * grad ** 2
+            m_hat = m_adam / (1 - beta1 ** t_adam)
+            v_hat = v_adam / (1 - beta2 ** t_adam)
+            params = params - lr * m_hat / (np.sqrt(v_hat) + eps)
+
+            # Renormalize moment direction to stay on unit sphere
+            moment_norm = np.linalg.norm(params[3:6])
+            if moment_norm > 1e-12:
+                params[3:6] /= moment_norm
+
+            # Compute full E-field for visualization every few iterations
+            if iteration % 5 == 0 or iteration == max_iters - 1:
+                pos_m = params[:3] * 1e-3
+                moment_dir = params[3:6] / np.linalg.norm(params[3:6])
+                dAdt = magnetic_dipole_dadt(pos_m, moment_dir, DIDT,
+                                            self.mesh.nodes)
+                b = assemble_rhs_tms(self.mesh, dAdt, self._G)
+                phi = np.zeros(len(self.mesh.nodes), dtype=np.float64)
+                phi[1:] = self._K_factor(b[1:])
+                self.E = compute_efield_at_elements(
+                    self.mesh, phi, dAdt, self._G
+                )
+                self._dAdt = dAdt
+                if self._sharedEnorm is not None:
+                    self._sharedEnorm[:] = np.linalg.norm(self.E, axis=1)
+
+                # Emit current probe position
+                mat = self._params_to_matrix(params)
+                vals = " ".join(f"{v:.6f}" for v in mat.ravel())
+                print(f"OPT_PROBE {vals}")
+                print(f"E_UPDATED iter={iteration} loss={loss:.6e} converged=0")
+                sys.stdout.flush()
+
+            # Convergence check
+            if prev_loss is not None and abs(loss - prev_loss) < 1e-8:
+                break
+            prev_loss = loss
+
+        # Final full solve and emit
+        pos_m = params[:3] * 1e-3
+        moment_dir = params[3:6] / np.linalg.norm(params[3:6])
+        dAdt = magnetic_dipole_dadt(pos_m, moment_dir, DIDT, self.mesh.nodes)
+        b = assemble_rhs_tms(self.mesh, dAdt, self._G)
+        phi = np.zeros(len(self.mesh.nodes), dtype=np.float64)
+        phi[1:] = self._K_factor(b[1:])
+        self.E = compute_efield_at_elements(self.mesh, phi, dAdt, self._G)
+        self._dAdt = dAdt
+        if self._sharedEnorm is not None:
+            self._sharedEnorm[:] = np.linalg.norm(self.E, axis=1)
+
+        mat = self._params_to_matrix(params)
+        self._last_probe_mat = mat
+        vals = " ".join(f"{v:.6f}" for v in mat.ravel())
+        print(f"OPT_PROBE {vals}")
+        print(f"OPTIMIZE_DONE iter={iteration} loss={loss:.6e}")
+        sys.stdout.flush()
+        return None
 
     # ------------------------------------------------------------------
     # Internal helpers

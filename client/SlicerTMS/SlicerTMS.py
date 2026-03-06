@@ -349,6 +349,19 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
         headFollowRow.addWidget(self.offsetSpin)
         vizForm.addRow(headFollowRow)
 
+        # Coil optimization
+        self.optimizeCheck = qt.QCheckBox("Optimize coil position")
+        self.optimizeCheck.setToolTip(
+            "Place a target point inside the brain. The coil position and "
+            "orientation will be optimized to maximize the E-field at that "
+            "point using adjoint-based gradient descent."
+        )
+        self.optimizeCheck.toggled.connect(self._onOptimizeToggled)
+        vizForm.addRow(self.optimizeCheck)
+
+        self.optStatusLabel = qt.QLabel("")
+        vizForm.addRow("", self.optStatusLabel)
+
         # Live solver switching
         switchRow = qt.QHBoxLayout()
         self.liveSolverCombo = qt.QComboBox()
@@ -534,6 +547,7 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
     def _stopService(self):
         self.logic.stopService()
         self.headFollowCheck.setChecked(False)
+        self.optimizeCheck.setChecked(False)
         self._setStatus("Stopped")
         self.startSvcBtn.setEnabled(True)
         self.stopSvcBtn.setEnabled(False)
@@ -546,6 +560,11 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
 
     def _onOffsetChanged(self, value):
         self.logic._headFollowOffset = value
+
+    def _onOptimizeToggled(self, checked):
+        self.logic.setOptimizationEnabled(checked)
+        if not checked:
+            self.optStatusLabel.setText("")
 
     def _switchSolver(self):
         solver = self.liveSolverCombo.currentData
@@ -588,6 +607,10 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         self._smoothedVolume   = None   # vtkImageData for volume gradient fallback
         self._volumeRasToIjk   = None   # vtkMatrix4x4 for volume fallback
         self._volumeIjkToRas   = None
+        # Coil optimization
+        self._optimizing       = False
+        self._optTargetNode    = None   # vtkMRMLMarkupsFiducialNode
+        self._optTargetObsTag  = None
         # QProcess signal slots (stored to prevent GC)
         self._onStateChangedSlot = None
         self._onReadyReadOutSlot = None
@@ -1146,7 +1169,13 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             needs_update = False
             for line in data.data().decode("utf-8", errors="replace").rstrip("\n").split("\n"):
                 log.info(f"[TMSService] {line}")
-                if (line.startswith("E_UPDATED") or line.startswith("STREAMING_READY")) \
+                if line.startswith("OPT_PROBE"):
+                    self._handleOptProbe(line)
+                elif line.startswith("OPTIMIZE_DONE"):
+                    self._optimizing = False
+                    log.info("Optimization converged")
+                    needs_update = True
+                elif (line.startswith("E_UPDATED") or line.startswith("STREAMING_READY")) \
                         and self._sharedEnorm is not None:
                     needs_update = True
             if needs_update:
@@ -1618,6 +1647,64 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             return nodes.GetItemAsObject(0)
         return None
 
+    # ------------------------------------------------------------------
+    # Coil position optimization
+    # ------------------------------------------------------------------
+
+    def setOptimizationEnabled(self, enabled):
+        """Enable or disable coil position optimization mode."""
+        self._optimizing = False
+        if enabled:
+            if self._optTargetNode is None:
+                self._optTargetNode = slicer.mrmlScene.AddNewNodeByClass(
+                    "vtkMRMLMarkupsFiducialNode", "Optimization Target"
+                )
+                self._optTargetNode.CreateDefaultDisplayNodes()
+                dn = self._optTargetNode.GetDisplayNode()
+                dn.SetGlyphScale(4.0)
+                dn.SetSelectedColor(0.0, 1.0, 0.0)  # green
+            if self._optTargetObsTag is None:
+                self._optTargetObsTag = self._optTargetNode.AddObserver(
+                    slicer.vtkMRMLMarkupsNode.PointModifiedEvent,
+                    self._onOptTargetMoved,
+                )
+            # Enter persistent place mode
+            interactionNode = slicer.app.applicationLogic().GetInteractionNode()
+            selectionNode = slicer.app.applicationLogic().GetSelectionNode()
+            selectionNode.SetReferenceActivePlaceNodeID(
+                self._optTargetNode.GetID()
+            )
+            interactionNode.SetCurrentInteractionMode(interactionNode.Place)
+            interactionNode.SetPlaceModePersistence(True)
+            log.info("Optimization mode enabled")
+        else:
+            if self._optTargetNode is not None and self._optTargetObsTag is not None:
+                self._optTargetNode.RemoveObserver(self._optTargetObsTag)
+                self._optTargetObsTag = None
+            interactionNode = slicer.app.applicationLogic().GetInteractionNode()
+            interactionNode.SetCurrentInteractionMode(interactionNode.ViewTransform)
+            log.info("Optimization mode disabled")
+
+    def _onOptTargetMoved(self, caller, event):
+        """Called when the optimization target fiducial is placed or moved."""
+        if self._process is None:
+            return
+        node = caller
+        nPts = node.GetNumberOfControlPoints()
+        if nPts == 0:
+            return
+        # Keep only the last control point
+        while nPts > 1:
+            node.RemoveNthControlPoint(0)
+            nPts = node.GetNumberOfControlPoints()
+
+        pos = [0.0, 0.0, 0.0]
+        node.GetNthControlPointPositionWorld(0, pos)
+        self._optimizing = True
+        cmd = f"OPTIMIZE {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}\n"
+        self._process.write(cmd.encode("utf-8"))
+        log.info(f"Sent OPTIMIZE target=[{pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}]")
+
     def switchSolver(self, solver):
         """Switch solver backend without reloading the mesh."""
         if self._tms is None:
@@ -1631,6 +1718,8 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         """
         log.info("stopService: begin teardown")
         self.setHeadFollowingEnabled(False)
+        self.setOptimizationEnabled(False)
+        self._optimizing = False
         self._removeCoilModel()
         self._scalpLocator = None
         self._scalpPolyData = None
@@ -1694,6 +1783,9 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
     def _onProbeTransformModified(self, node, event):
         if self._process is None or self._meshNode is None:
             return
+        # During optimization, the service drives the probe — don't send back
+        if self._optimizing:
+            return
         try:
             node.GetMatrixTransformToParent(self._probeMatrix)
             mat = slicer.util.arrayFromVTKMatrix(self._probeMatrix)
@@ -1703,6 +1795,22 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             log.debug(f"probe moved: pos=[{pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}]")
         except Exception as exc:
             log.error(f"updateEField error: {exc}", exc_info=True)
+
+    def _handleOptProbe(self, line):
+        """Update the probe transform from an OPT_PROBE message (service → client)."""
+        if self._probeNode is None:
+            return
+        try:
+            floats = [float(x) for x in line.split()[1:]]
+            if len(floats) != 16:
+                return
+            mat = vtk.vtkMatrix4x4()
+            for i in range(4):
+                for j in range(4):
+                    mat.SetElement(i, j, floats[i * 4 + j])
+            self._probeNode.SetMatrixTransformToParent(mat)
+        except Exception as exc:
+            log.error(f"_handleOptProbe error: {exc}", exc_info=True)
 
     def _updateMeshColors(self):
         # Compute a robust scalar range from the brain model (99.5th pctl)
