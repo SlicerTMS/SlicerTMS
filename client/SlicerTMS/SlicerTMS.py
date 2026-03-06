@@ -1199,6 +1199,17 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             self._probeNode.RemoveObserver(self._probeObsTag)
             self._probeObsTag = None
 
+        # Send STOP *before* closing RPyC — the solve loop blocks on
+        # stdin.readline(), so closing RPyC first would hang because the
+        # server's RPyC thread can't process the disconnect.
+        if self._process is not None \
+                and self._process.state() != qt.QProcess.NotRunning:
+            try:
+                self._process.write(b"STOP\n")
+                self._process.waitForBytesWritten(1000)
+            except Exception:
+                pass
+
         if self._tms is not None:
             try:
                 self._tms.close()
@@ -1207,14 +1218,6 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             self._tms = None
 
         if self._process is not None:
-            # Signal the streaming solve loop to exit gracefully
-            if self._process.state() != qt.QProcess.NotRunning:
-                try:
-                    self._process.write(b"STOP\n")
-                    self._process.waitForBytesWritten(1000)
-                except Exception:
-                    pass
-
             self._disconnectProcessSignals()
 
             if self._process.state() != qt.QProcess.NotRunning:
