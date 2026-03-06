@@ -829,8 +829,17 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             vtk.util.numpy_support.vtk_to_numpy(tagArr)[:] = tag1
             meshGrid.GetCellData().AddArray(tagArr)
 
+        # Cell-index array propagated through threshold + geometry filters
+        # to map surface faces back to the original UG cell indices.
+        origIdArr = vtk.vtkIntArray()
+        origIdArr.SetName("_OrigCellIds")
+        origIdArr.SetNumberOfValues(nCells)
+        vtk.util.numpy_support.vtk_to_numpy(origIdArr)[:] = numpy.arange(
+            nCells, dtype=numpy.int32
+        )
+        meshGrid.GetCellData().AddArray(origIdArr)
+
         # --- Extract tissue boundary surfaces ---
-        # Remove any previous tissue models
         self._removeTissueModels()
 
         if tag1 is not None:
@@ -881,16 +890,26 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
 
             gf = vtk.vtkGeometryFilter()
             gf.SetInputConnection(thresh.GetOutputPort())
-            gf.PassThroughCellIdsOn()
             gf.Update()
             surface = gf.GetOutput()
 
             if surface.GetNumberOfCells() == 0:
                 continue
 
-            origIds = surface.GetCellData().GetArray("vtkOriginalCellIds")
+            # _OrigCellIds propagated from the UG through both filters
+            origIds = surface.GetCellData().GetArray("_OrigCellIds")
             cellMap = vtk.util.numpy_support.vtk_to_numpy(origIds).copy()
-            surface.GetCellData().RemoveArray("vtkOriginalCellIds")
+            surface.GetCellData().RemoveArray("_OrigCellIds")
+
+            # Precompute cell→point averaging for smooth rendering
+            c2pConn, c2pCounts = self._precomputeCellToPoint(surface)
+
+            # Add point-data Enorm array for smooth interpolated display
+            ptEnorm = vtk.vtkDoubleArray()
+            ptEnorm.SetName("Enorm")
+            ptEnorm.SetNumberOfValues(surface.GetNumberOfPoints())
+            ptEnorm.FillComponent(0, 0.0)
+            surface.GetPointData().AddArray(ptEnorm)
 
             name = f"TMS E-field - {cfg['name']}"
             node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
@@ -903,13 +922,14 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             dn.SetAndObserveColorNodeID(
                 "vtkMRMLColorTableNodeFileViridis.txt"
             )
-            dn.SetActiveScalar("Enorm", vtk.vtkAssignAttribute.CELL_DATA)
+            dn.SetActiveScalar("Enorm", vtk.vtkAssignAttribute.POINT_DATA)
             dn.SetScalarVisibility(True)
             dn.SetAutoScalarRange(False)
             dn.SetOpacity(cfg["opacity"])
 
             self._tissueModels.append({
                 "node": node, "cellMap": cellMap, "tag": int(tag),
+                "c2pConn": c2pConn, "c2pCounts": c2pCounts,
             })
             log.info(f"  tag={tag} ({cfg['name']}): "
                      f"{surface.GetNumberOfCells()} faces, "
@@ -923,16 +943,33 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
 
     def _extractOuterSurface(self, meshGrid):
         """Fallback: extract just the outer surface when tag1 is unavailable."""
-        nCells = meshGrid.GetNumberOfCells()
+        # Ensure _OrigCellIds exists (may not if called from setupVisualization)
+        if meshGrid.GetCellData().GetArray("_OrigCellIds") is None:
+            nCells = meshGrid.GetNumberOfCells()
+            origIdArr = vtk.vtkIntArray()
+            origIdArr.SetName("_OrigCellIds")
+            origIdArr.SetNumberOfValues(nCells)
+            vtk.util.numpy_support.vtk_to_numpy(origIdArr)[:] = numpy.arange(
+                nCells, dtype=numpy.int32
+            )
+            meshGrid.GetCellData().AddArray(origIdArr)
+
         gf = vtk.vtkGeometryFilter()
         gf.SetInputData(meshGrid)
-        gf.PassThroughCellIdsOn()
         gf.Update()
         surface = gf.GetOutput()
 
-        origIds = surface.GetCellData().GetArray("vtkOriginalCellIds")
+        origIds = surface.GetCellData().GetArray("_OrigCellIds")
         cellMap = vtk.util.numpy_support.vtk_to_numpy(origIds).copy()
-        surface.GetCellData().RemoveArray("vtkOriginalCellIds")
+        surface.GetCellData().RemoveArray("_OrigCellIds")
+
+        c2pConn, c2pCounts = self._precomputeCellToPoint(surface)
+
+        ptEnorm = vtk.vtkDoubleArray()
+        ptEnorm.SetName("Enorm")
+        ptEnorm.SetNumberOfValues(surface.GetNumberOfPoints())
+        ptEnorm.FillComponent(0, 0.0)
+        surface.GetPointData().AddArray(ptEnorm)
 
         node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
         node.SetName("TMS E-field")
@@ -942,11 +979,14 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         dn = node.GetDisplayNode()
         dn.SetVisibility(False)
         dn.SetAndObserveColorNodeID("vtkMRMLColorTableNodeFileViridis.txt")
-        dn.SetActiveScalar("Enorm", vtk.vtkAssignAttribute.CELL_DATA)
+        dn.SetActiveScalar("Enorm", vtk.vtkAssignAttribute.POINT_DATA)
         dn.SetScalarVisibility(True)
         dn.SetAutoScalarRange(True)
 
-        self._tissueModels.append({"node": node, "cellMap": cellMap, "tag": 0})
+        self._tissueModels.append({
+            "node": node, "cellMap": cellMap, "tag": 0,
+            "c2pConn": c2pConn, "c2pCounts": c2pCounts,
+        })
         self._meshNode = node
 
         log.info(f"  outer surface: {surface.GetNumberOfCells()} faces")
@@ -958,6 +998,24 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
                 slicer.mrmlScene.RemoveNode(m["node"])
         self._tissueModels = []
         self._meshNode = None
+
+    @staticmethod
+    def _precomputeCellToPoint(surface):
+        """Precompute cell-to-point connectivity for smooth averaging.
+
+        Returns (conn, counts) where:
+          conn   — flat int32 array of point IDs, len = nCells * 3
+          counts — float64 per-point cell counts, len = nPoints
+        """
+        nCells = surface.GetNumberOfCells()
+        nPoints = surface.GetNumberOfPoints()
+        conn = vtk.util.numpy_support.vtk_to_numpy(
+            surface.GetPolys().GetConnectivityArray()
+        )[:nCells * 3].astype(numpy.int32).copy()
+        counts = numpy.zeros(nPoints, dtype=numpy.float64)
+        numpy.add.at(counts, conn, 1.0)
+        counts[counts == 0] = 1.0  # avoid division by zero
+        return conn, counts
 
     # ------------------------------------------------------------------
     # Service lifecycle
@@ -1336,9 +1394,19 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
 
         for m in self._tissueModels:
             node = m["node"]
-            eArray = slicer.util.arrayFromModelCellData(node, "Enorm")
-            eArray[:] = self._sharedEnorm[m["cellMap"]]
-            slicer.util.arrayFromModelCellDataModified(node, "Enorm")
+            cellEnorm = self._sharedEnorm[m["cellMap"]]
+
+            # Cell→point averaging for smooth interpolated rendering
+            conn = m["c2pConn"]
+            counts = m["c2pCounts"]
+            nPoints = node.GetPolyData().GetNumberOfPoints()
+            pointEnorm = numpy.zeros(nPoints, dtype=numpy.float64)
+            numpy.add.at(pointEnorm, conn, numpy.repeat(cellEnorm, 3))
+            pointEnorm /= counts
+
+            eArray = slicer.util.arrayFromModelPointData(node, "Enorm")
+            eArray[:] = pointEnorm
+            slicer.util.arrayFromModelPointDataModified(node, "Enorm")
             dn = node.GetDisplayNode()
             if not dn.GetVisibility():
                 dn.SetVisibility(True)
