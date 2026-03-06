@@ -92,7 +92,6 @@ class TMSService(rpyc.SlaveService):
             Starting backend: "numpy", "warp_cpu", or "warp_gpu".
         """
         from tmswarp.conductor import TetMesh
-        from tmswarp.solver import gradient_operator, assemble_stiffness
 
         self._solver = solver
         self._K_factor = None
@@ -112,15 +111,18 @@ class TMSService(rpyc.SlaveService):
             f"{len(self.mesh.elements):,} elements"
         )
 
-        print("Assembling stiffness matrix ...")
-        self._G = gradient_operator(self.mesh)
-        self._K = assemble_stiffness(self.mesh, self._G)
-        print("  Done.")
-
-        if solver == "numpy":
-            self._prefactorize_K()
-        elif solver in ("warp_cpu", "warp_gpu"):
+        if solver in ("warp_cpu", "warp_gpu"):
+            # Warp builds its own stiffness matrix on GPU — skip numpy assembly
+            self._G = None
+            self._K = None
             self._warmup_warp(solver)
+        else:
+            from tmswarp.solver import gradient_operator, assemble_stiffness
+            print("Assembling stiffness matrix ...")
+            self._G = gradient_operator(self.mesh)
+            self._K = assemble_stiffness(self.mesh, self._G)
+            print("  Done.")
+            self._prefactorize_K()
 
         # Initial solve — coil 100 mm above head centre (positive z)
         init_mat = np.eye(4, dtype=np.float64)
@@ -144,6 +146,13 @@ class TMSService(rpyc.SlaveService):
             raise RuntimeError("Call initialize_system() first.")
 
         if solver == "numpy" and self._K_factor is None:
+            # Assemble numpy stiffness if not yet done (e.g. started with warp)
+            if self._K is None:
+                from tmswarp.solver import gradient_operator, assemble_stiffness
+                print("Assembling stiffness matrix ...")
+                self._G = gradient_operator(self.mesh)
+                self._K = assemble_stiffness(self.mesh, self._G)
+                print("  Done.")
             self._prefactorize_K()
         elif solver in ("warp_cpu", "warp_gpu"):
             self._warmup_warp(solver)
@@ -223,6 +232,11 @@ class TMSService(rpyc.SlaveService):
         self._sharedEnorm = np.ndarray(
             (n_elem,), dtype=np.float64, buffer=self._shmEnorm.buf
         )
+
+        # Publish the initial E-field so the mesh shows colors immediately
+        if self.E is not None:
+            self._sharedEnorm[:] = np.linalg.norm(self.E, axis=1)
+
         print(f"STREAMING_READY solver={self._solver}")
         sys.stdout.flush()
         self._solve_loop()
@@ -434,13 +448,11 @@ class TMSService(rpyc.SlaveService):
 
     def _solve_and_update(self, dAdt):
         """Run the selected backend, compute E-field, store in self.E."""
-        from tmswarp.solver import assemble_rhs_tms
         from tmswarp.fields import compute_efield_at_elements
 
-        b = assemble_rhs_tms(self.mesh, dAdt, self._G)
-
         if self._solver == "numpy":
-            # Fast path: apply pre-factorized K⁻¹ to reduced RHS
+            from tmswarp.solver import assemble_rhs_tms
+            b = assemble_rhs_tms(self.mesh, dAdt, self._G)
             phi_reduced = self._K_factor(b[1:])
             phi = np.zeros(len(self.mesh.nodes), dtype=np.float64)
             phi[1:] = phi_reduced

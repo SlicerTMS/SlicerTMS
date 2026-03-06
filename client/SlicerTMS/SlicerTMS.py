@@ -940,7 +940,8 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             lines = data.data().decode("utf-8", errors="replace").rstrip("\n").split("\n")
             for line in lines:
                 log.info(f"[TMSService] {line}")
-                if line.startswith("E_UPDATED") and self._sharedEnorm is not None:
+                if (line.startswith("E_UPDATED") or line.startswith("STREAMING_READY")) \
+                        and self._sharedEnorm is not None:
                     needs_update = True
             if needs_update:
                 t1 = _time.perf_counter()
