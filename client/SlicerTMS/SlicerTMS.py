@@ -327,6 +327,28 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
         self.probeSelector.currentNodeChanged.connect(self._onProbeNodeChanged)
         vizForm.addRow("Probe transform:", self.probeSelector)
 
+        # Head-following mode
+        headFollowRow = qt.QHBoxLayout()
+        self.headFollowCheck = qt.QCheckBox("Head-following mode")
+        self.headFollowCheck.setToolTip(
+            "Click on the scalp to position and orient the TMS coil "
+            "along the surface normal."
+        )
+        self.headFollowCheck.toggled.connect(self._onHeadFollowToggled)
+        headFollowRow.addWidget(self.headFollowCheck)
+        headFollowRow.addWidget(qt.QLabel("Offset:"))
+        self.offsetSpin = qt.QDoubleSpinBox()
+        self.offsetSpin.setRange(0.0, 50.0)
+        self.offsetSpin.setValue(10.0)
+        self.offsetSpin.setSuffix(" mm")
+        self.offsetSpin.setSingleStep(1.0)
+        self.offsetSpin.setToolTip(
+            "Distance from scalp surface to coil center along the normal"
+        )
+        self.offsetSpin.valueChanged.connect(self._onOffsetChanged)
+        headFollowRow.addWidget(self.offsetSpin)
+        vizForm.addRow(headFollowRow)
+
         # Live solver switching
         switchRow = qt.QHBoxLayout()
         self.liveSolverCombo = qt.QComboBox()
@@ -511,12 +533,19 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
 
     def _stopService(self):
         self.logic.stopService()
+        self.headFollowCheck.setChecked(False)
         self._setStatus("Stopped")
         self.startSvcBtn.setEnabled(True)
         self.stopSvcBtn.setEnabled(False)
 
     def _onProbeNodeChanged(self, node):
         self.logic.setProbeTransformNode(node)
+
+    def _onHeadFollowToggled(self, checked):
+        self.logic.setHeadFollowingEnabled(checked)
+
+    def _onOffsetChanged(self, value):
+        self.logic._headFollowOffset = value
 
     def _switchSolver(self):
         solver = self.liveSolverCombo.currentData
@@ -547,6 +576,18 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         self._probeNode    = None   # vtkMRMLLinearTransformNode
         self._probeObsTag  = None   # observer tag
         self._probeMatrix  = vtk.vtkMatrix4x4()
+        # Coil model
+        self._coilModelNode = None
+        # Head-following mode
+        self._headFollowing    = False
+        self._headFollowOffset = 10.0   # mm above scalp surface
+        self._fiducialNode     = None   # vtkMRMLMarkupsFiducialNode
+        self._fiducialObsTag   = None
+        self._scalpLocator     = None   # vtkCellLocator for scalp surface
+        self._scalpPolyData    = None   # polydata with cell normals
+        self._smoothedVolume   = None   # vtkImageData for volume gradient fallback
+        self._volumeRasToIjk   = None   # vtkMatrix4x4 for volume fallback
+        self._volumeIjkToRas   = None
         # QProcess signal slots (stored to prevent GC)
         self._onStateChangedSlot = None
         self._onReadyReadOutSlot = None
@@ -941,6 +982,9 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             self._tissueModels[0]["node"] if self._tissueModels else None
         )
 
+        # Pre-build scalp cell locator for head-following mode
+        self._buildScalpLocator()
+
     def _extractOuterSurface(self, meshGrid):
         """Fallback: extract just the outer surface when tag1 is unavailable."""
         # Ensure _OrigCellIds exists (may not if called from setupVisualization)
@@ -1293,6 +1337,13 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             self._probeObsTag = None
 
         self._probeNode = node
+
+        # Create coil model and parent it under the probe transform
+        if node is not None:
+            self._createCoilModel()
+            if self._coilModelNode is not None:
+                self._coilModelNode.SetAndObserveTransformNodeID(node.GetID())
+
         if node is None or self._process is None:
             return
 
@@ -1301,6 +1352,271 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             self._onProbeTransformModified,
         )
         node.TransformModified()   # trigger initial update
+
+    # ------------------------------------------------------------------
+    # Coil model
+    # ------------------------------------------------------------------
+
+    def _createCoilModel(self):
+        """Create a procedural figure-8 TMS coil (two cylinders) model node."""
+        if self._coilModelNode is not None:
+            return
+        appendPolyData = vtk.vtkAppendPolyData()
+        for sign in (-1, 1):
+            cyl = vtk.vtkCylinderSource()
+            cyl.SetRadius(15)
+            cyl.SetHeight(6)
+            cyl.SetResolution(50)
+            xform = vtk.vtkTransform()
+            xform.RotateX(90)           # lay flat (Y axis -> Z axis)
+            xform.Translate(sign * 20, 0, 0)
+            tf = vtk.vtkTransformPolyDataFilter()
+            tf.SetInputConnection(cyl.GetOutputPort())
+            tf.SetTransform(xform)
+            tf.Update()
+            appendPolyData.AddInputData(tf.GetOutput())
+        appendPolyData.Update()
+
+        node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", "TMS Coil")
+        node.SetAndObservePolyData(appendPolyData.GetOutput())
+        node.CreateDefaultDisplayNodes()
+        dn = node.GetDisplayNode()
+        dn.SetColor(1.0, 1.0, 0.0)
+        dn.SetOpacity(0.6)
+        node.SetSelectable(0)
+        self._coilModelNode = node
+        log.info("Created TMS Coil model")
+
+    def _removeCoilModel(self):
+        """Remove the coil model from the scene."""
+        if self._coilModelNode is not None:
+            slicer.mrmlScene.RemoveNode(self._coilModelNode)
+            self._coilModelNode = None
+
+    # ------------------------------------------------------------------
+    # Head-following mode
+    # ------------------------------------------------------------------
+
+    def setHeadFollowingEnabled(self, enabled):
+        """Enable or disable head-following mode."""
+        self._headFollowing = enabled
+        if enabled:
+            if self._scalpLocator is None:
+                self._buildScalpLocator()
+            if self._fiducialNode is None:
+                self._fiducialNode = slicer.mrmlScene.AddNewNodeByClass(
+                    "vtkMRMLMarkupsFiducialNode", "TMS Target"
+                )
+                self._fiducialNode.CreateDefaultDisplayNodes()
+                dn = self._fiducialNode.GetDisplayNode()
+                dn.SetGlyphScale(3.0)
+                dn.SetSelectedColor(1.0, 0.5, 0.0)
+            if self._fiducialObsTag is None:
+                self._fiducialObsTag = self._fiducialNode.AddObserver(
+                    slicer.vtkMRMLMarkupsNode.PointModifiedEvent,
+                    self._onFiducialMoved,
+                )
+            # Enter persistent place mode for this fiducial
+            interactionNode = slicer.app.applicationLogic().GetInteractionNode()
+            selectionNode = slicer.app.applicationLogic().GetSelectionNode()
+            selectionNode.SetReferenceActivePlaceNodeID(
+                self._fiducialNode.GetID()
+            )
+            interactionNode.SetCurrentInteractionMode(interactionNode.Place)
+            interactionNode.SetPlaceModePersistence(True)
+            log.info("Head-following mode enabled")
+        else:
+            if self._fiducialNode is not None and self._fiducialObsTag is not None:
+                self._fiducialNode.RemoveObserver(self._fiducialObsTag)
+                self._fiducialObsTag = None
+            interactionNode = slicer.app.applicationLogic().GetInteractionNode()
+            interactionNode.SetCurrentInteractionMode(interactionNode.ViewTransform)
+            log.info("Head-following mode disabled")
+
+    def _onFiducialMoved(self, caller, event):
+        """Callback when TMS Target fiducial is placed or moved."""
+        if not self._headFollowing:
+            return
+        node = caller
+        nPts = node.GetNumberOfControlPoints()
+        if nPts == 0:
+            return
+        # Keep only the last control point
+        while nPts > 1:
+            node.RemoveNthControlPoint(0)
+            nPts = node.GetNumberOfControlPoints()
+
+        pos = [0.0, 0.0, 0.0]
+        node.GetNthControlPointPositionWorld(0, pos)
+
+        closestPoint, normal = self._computeSurfaceNormalAtPoint(pos)
+        if closestPoint is None:
+            log.warning("Head-following: could not compute surface normal")
+            return
+        self._orientProbeToNormal(closestPoint, normal)
+
+    def _orientProbeToNormal(self, surfacePoint, normal):
+        """Set TMS Probe so Z = outward normal, offset above the surface."""
+        if self._probeNode is None:
+            return
+        import numpy as np
+        n = np.array(normal, dtype=np.float64)
+        nLen = np.linalg.norm(n)
+        if nLen < 1e-8:
+            return
+        n /= nLen
+
+        # Build orthonormal frame
+        ref = np.array([0.0, 0.0, 1.0])
+        if abs(np.dot(n, ref)) > 0.9:
+            ref = np.array([1.0, 0.0, 0.0])
+        vecX = np.cross(ref, n)
+        vecX /= np.linalg.norm(vecX)
+        vecY = np.cross(n, vecX)
+
+        origin = np.array(surfacePoint) + self._headFollowOffset * n
+
+        mat = vtk.vtkMatrix4x4()
+        for i in range(3):
+            mat.SetElement(i, 0, vecX[i])
+            mat.SetElement(i, 1, vecY[i])
+            mat.SetElement(i, 2, n[i])
+            mat.SetElement(i, 3, origin[i])
+        self._probeNode.SetMatrixTransformToParent(mat)
+
+    # ------------------------------------------------------------------
+    # Surface normal computation
+    # ------------------------------------------------------------------
+
+    def _buildScalpLocator(self):
+        """Build a vtkCellLocator from the scalp surface (tag=5)."""
+        self._scalpLocator = None
+        self._scalpPolyData = None
+        scalp = [m for m in self._tissueModels if m["tag"] == 5]
+        if not scalp:
+            log.info("_buildScalpLocator: no scalp surface (tag=5)")
+            return False
+        polydata = scalp[0]["node"].GetPolyData()
+        if polydata is None or polydata.GetNumberOfCells() == 0:
+            return False
+        normals = vtk.vtkPolyDataNormals()
+        normals.SetInputData(polydata)
+        normals.ComputePointNormalsOff()
+        normals.ComputeCellNormalsOn()
+        normals.ConsistencyOn()
+        normals.AutoOrientNormalsOn()
+        normals.SplittingOff()
+        normals.Update()
+        self._scalpPolyData = normals.GetOutput()
+        locator = vtk.vtkCellLocator()
+        locator.SetDataSet(self._scalpPolyData)
+        locator.BuildLocator()
+        self._scalpLocator = locator
+        log.info(f"_buildScalpLocator: {self._scalpPolyData.GetNumberOfCells()} cells")
+        return True
+
+    def _computeSurfaceNormalAtPoint(self, point):
+        """Compute outward surface normal near a point.
+
+        Uses scalp mesh locator if available, otherwise falls back
+        to volume gradient.  Returns (closestPoint, normal) or (None, None).
+        """
+        if self._scalpLocator is not None:
+            return self._computeNormalFromMesh(point)
+        return self._computeNormalFromVolume(point)
+
+    def _computeNormalFromMesh(self, point):
+        """Find closest point on scalp mesh and return its cell normal."""
+        closestPoint = [0.0, 0.0, 0.0]
+        cellId = vtk.reference(0)
+        subId = vtk.reference(0)
+        dist2 = vtk.reference(0.0)
+        self._scalpLocator.FindClosestPoint(point, closestPoint, cellId, subId, dist2)
+        cellNormals = self._scalpPolyData.GetCellData().GetNormals()
+        if cellNormals is None:
+            return None, None
+        normal = [0.0, 0.0, 0.0]
+        cellNormals.GetTuple(cellId.get(), normal)
+        nLen = (normal[0]**2 + normal[1]**2 + normal[2]**2) ** 0.5
+        if nLen < 1e-8:
+            return None, None
+        normal = [c / nLen for c in normal]
+        return closestPoint, normal
+
+    def _computeNormalFromVolume(self, point):
+        """Compute surface normal from volume gradient (fallback).
+
+        Finds the background volume, smooths it, and evaluates the gradient
+        at the given RAS point using central differences.
+        """
+        import numpy as np
+
+        # Lazily build the smoothed volume
+        if self._smoothedVolume is None:
+            volumeNode = self._findBackgroundVolume()
+            if volumeNode is None:
+                return None, None
+            gaussian = vtk.vtkImageGaussianSmooth()
+            gaussian.SetInputData(volumeNode.GetImageData())
+            gaussian.SetStandardDeviations(2.0, 2.0, 2.0)
+            gaussian.Update()
+            self._smoothedVolume = vtk.vtkImageData()
+            self._smoothedVolume.DeepCopy(gaussian.GetOutput())
+            self._volumeRasToIjk = vtk.vtkMatrix4x4()
+            volumeNode.GetRASToIJKMatrix(self._volumeRasToIjk)
+            self._volumeIjkToRas = vtk.vtkMatrix4x4()
+            volumeNode.GetIJKToRASMatrix(self._volumeIjkToRas)
+            log.info("Built smoothed volume for gradient fallback")
+
+        # Convert RAS point to IJK
+        p_ijk_h = self._volumeRasToIjk.MultiplyPoint(
+            [point[0], point[1], point[2], 1.0]
+        )
+        i = int(round(p_ijk_h[0]))
+        j = int(round(p_ijk_h[1]))
+        k = int(round(p_ijk_h[2]))
+
+        imageData = self._smoothedVolume
+        dims = imageData.GetDimensions()
+        if not (1 <= i < dims[0]-1 and 1 <= j < dims[1]-1 and 1 <= k < dims[2]-1):
+            return None, None
+
+        gx = (imageData.GetScalarComponentAsDouble(i+1,j,k,0)
+              - imageData.GetScalarComponentAsDouble(i-1,j,k,0)) / 2.0
+        gy = (imageData.GetScalarComponentAsDouble(i,j+1,k,0)
+              - imageData.GetScalarComponentAsDouble(i,j-1,k,0)) / 2.0
+        gz = (imageData.GetScalarComponentAsDouble(i,j,k+1,0)
+              - imageData.GetScalarComponentAsDouble(i,j,k-1,0)) / 2.0
+
+        # Transform gradient from IJK to RAS using the direction matrix
+        dirMat = np.array([
+            [self._volumeIjkToRas.GetElement(r, c) for c in range(3)]
+            for r in range(3)
+        ])
+        gradient_ras = dirMat.dot(np.array([gx, gy, gz]))
+        nLen = np.linalg.norm(gradient_ras)
+        if nLen < 1e-8:
+            return None, None
+        normal = gradient_ras / nLen
+        return list(point), list(normal)
+
+    def _findBackgroundVolume(self):
+        """Find a scalar volume to use for gradient computation."""
+        layoutManager = slicer.app.layoutManager()
+        if layoutManager:
+            sliceWidget = layoutManager.sliceWidget("Red")
+            if sliceWidget:
+                compositeNode = sliceWidget.mrmlSliceCompositeNode()
+                bgId = compositeNode.GetBackgroundVolumeID()
+                if bgId:
+                    node = slicer.mrmlScene.GetNodeByID(bgId)
+                    if node:
+                        return node
+        # Fallback: first scalar volume in scene
+        nodes = slicer.mrmlScene.GetNodesByClass("vtkMRMLScalarVolumeNode")
+        if nodes.GetNumberOfItems() > 0:
+            return nodes.GetItemAsObject(0)
+        return None
 
     def switchSolver(self, solver):
         """Switch solver backend without reloading the mesh."""
@@ -1314,6 +1630,13 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         Uses graceful terminate() → waitForFinished() → kill() escalation.
         """
         log.info("stopService: begin teardown")
+        self.setHeadFollowingEnabled(False)
+        self._removeCoilModel()
+        self._scalpLocator = None
+        self._scalpPolyData = None
+        self._smoothedVolume = None
+        self._volumeRasToIjk = None
+        self._volumeIjkToRas = None
         if self._probeNode is not None and self._probeObsTag is not None:
             self._probeNode.RemoveObserver(self._probeObsTag)
             self._probeObsTag = None
