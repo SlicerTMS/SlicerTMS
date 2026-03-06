@@ -905,7 +905,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             )
             dn.SetActiveScalar("Enorm", vtk.vtkAssignAttribute.CELL_DATA)
             dn.SetScalarVisibility(True)
-            dn.SetAutoScalarRange(True)
+            dn.SetAutoScalarRange(False)
             dn.SetOpacity(cfg["opacity"])
 
             self._tissueModels.append({
@@ -1324,15 +1324,25 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             log.error(f"updateEField error: {exc}", exc_info=True)
 
     def _updateMeshColors(self):
+        # Compute a robust scalar range from the brain model (99.5th pctl)
+        # so outliers don't squash visible E-field variation.
+        brain = [m for m in self._tissueModels if m["tag"] == 2]
+        if brain:
+            brainE = self._sharedEnorm[brain[0]["cellMap"]]
+            upper = float(numpy.percentile(brainE, 99.5))
+        else:
+            upper = float(numpy.percentile(self._sharedEnorm, 99.5))
+        scalarRange = (0.0, max(upper, 1.0))
+
         for m in self._tissueModels:
             node = m["node"]
-            cellMap = m["cellMap"]
             eArray = slicer.util.arrayFromModelCellData(node, "Enorm")
-            eArray[:] = self._sharedEnorm[cellMap]
+            eArray[:] = self._sharedEnorm[m["cellMap"]]
             slicer.util.arrayFromModelCellDataModified(node, "Enorm")
             dn = node.GetDisplayNode()
             if not dn.GetVisibility():
                 dn.SetVisibility(True)
+            dn.SetScalarRange(*scalarRange)
             dn.Modified()
 
     def _cleanupSharedMemory(self):
