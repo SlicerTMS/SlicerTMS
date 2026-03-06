@@ -934,10 +934,13 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             return
         data = self._process.readAllStandardOutput()
         if data:
+            needs_update = False
             for line in data.data().decode("utf-8", errors="replace").rstrip("\n").split("\n"):
                 log.info(f"[TMSService] {line}")
                 if line.startswith("E_UPDATED") and self._sharedEnorm is not None:
-                    self._updateMeshColors()
+                    needs_update = True
+            if needs_update:
+                self._updateMeshColors()
 
     def _onReadyReadStderr(self):
         if self._process is None:
