@@ -930,17 +930,26 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             log.warning(f"TMSService error: {err}")
 
     def _onReadyReadStdout(self):
+        import time as _time
         if self._process is None:
             return
+        t0 = _time.perf_counter()
         data = self._process.readAllStandardOutput()
         if data:
             needs_update = False
-            for line in data.data().decode("utf-8", errors="replace").rstrip("\n").split("\n"):
+            lines = data.data().decode("utf-8", errors="replace").rstrip("\n").split("\n")
+            for line in lines:
                 log.info(f"[TMSService] {line}")
                 if line.startswith("E_UPDATED") and self._sharedEnorm is not None:
                     needs_update = True
             if needs_update:
+                t1 = _time.perf_counter()
                 self._updateMeshColors()
+                t2 = _time.perf_counter()
+                log.info(
+                    f"TIMING stdout_handler: {len(lines)} lines, "
+                    f"parse={t1-t0:.3f}s render={t2-t1:.3f}s total={t2-t0:.3f}s"
+                )
 
     def _onReadyReadStderr(self):
         if self._process is None:
@@ -1217,16 +1226,18 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
     # ------------------------------------------------------------------
 
     def _onProbeTransformModified(self, node, event):
+        import time as _time
         if self._process is None or self._meshNode is None:
             return
         try:
+            t0 = _time.perf_counter()
             node.GetMatrixTransformToParent(self._probeMatrix)
             mat = slicer.util.arrayFromVTKMatrix(self._probeMatrix)
             pos = mat[:3, 3]
-            log.debug(f"probe moved: pos=[{pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}]")
-            # Send probe position via QProcess stdin — non-blocking
             vals = " ".join(f"{v:.6f}" for v in mat.ravel())
             self._process.write(f"PROBE {vals}\n".encode("utf-8"))
+            t1 = _time.perf_counter()
+            log.debug(f"probe moved: pos=[{pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}] write={t1-t0:.3f}s")
         except Exception as exc:
             log.error(f"updateEField error: {exc}", exc_info=True)
 
