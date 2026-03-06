@@ -782,10 +782,10 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         """
         log.info(f"loadMeshToScene: {npzPath}")
         data = numpy.load(npzPath)
-        nodes_m      = data["nodes"].astype(numpy.float64)
-        elements     = data["elements"].astype(numpy.int32)
-        conductivity = data["conductivity"].astype(numpy.float64)
-        tag1         = data["tag1"].astype(numpy.int32) if "tag1" in data else None
+        nodes_m      = data["nodes"]
+        elements     = data["elements"]
+        conductivity = data["conductivity"]
+        tag1         = data["tag1"] if "tag1" in data else None
 
         nodes_mm = nodes_m * 1000.0  # metres → mm for VTK / Slicer
 
@@ -797,10 +797,11 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         vtk.util.numpy_support.vtk_to_numpy(pts.GetData())[:] = nodes_mm
         meshGrid.SetPoints(pts)
 
-        # VTK 9.5 requires int64 connectivity for vtkCellArray.SetData()
         nCells = elements.shape[0]
         offsets = numpy.arange(0, nCells * 4 + 1, 4, dtype=numpy.int64)
-        connectivity = elements.ravel().astype(numpy.int64)
+        connectivity = numpy.ascontiguousarray(
+            elements.ravel(), dtype=numpy.int64
+        )
         cells = vtk.vtkCellArray()
         cells.SetData(
             vtk.util.numpy_support.numpy_to_vtk(offsets, deep=True),
@@ -828,7 +829,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             vtk.util.numpy_support.vtk_to_numpy(tagArr)[:] = tag1
             meshGrid.GetCellData().AddArray(tagArr)
 
-        # --- Create or reuse Slicer model node ---
+        # --- Create or reuse Slicer model node (hidden until E-field ready) ---
         existing = slicer.mrmlScene.GetFirstNodeByName("TMS E-field")
         if existing and existing.IsA("vtkMRMLModelNode"):
             modelNode = existing
@@ -841,13 +842,14 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
 
         log.info(f"loadMeshToScene: {nCells} cells, {len(nodes_mm)} points")
 
-        # Default display: conductivity with Viridis (before service starts)
+        # Configure display but keep hidden — avoids 8s vtkDataSetMapper
+        # surface extraction.  Visibility is enabled when E-field arrives.
         dn = modelNode.GetDisplayNode()
+        dn.SetVisibility(False)
         dn.SetAndObserveColorNodeID("vtkMRMLColorTableNodeFileViridis.txt")
-        dn.SetActiveScalar("conductivity", vtk.vtkAssignAttribute.CELL_DATA)
+        dn.SetActiveScalar("Enorm", vtk.vtkAssignAttribute.CELL_DATA)
         dn.SetScalarVisibility(True)
         dn.SetAutoScalarRange(True)
-        dn.Modified()
 
         self._meshNode = modelNode
         return modelNode
@@ -1246,7 +1248,10 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         eArray = slicer.util.arrayFromModelCellData(self._meshNode, "Enorm")
         eArray[:] = self._sharedEnorm
         slicer.util.arrayFromModelCellDataModified(self._meshNode, "Enorm")
-        self._meshNode.GetDisplayNode().Modified()
+        dn = self._meshNode.GetDisplayNode()
+        if not dn.GetVisibility():
+            dn.SetVisibility(True)
+        dn.Modified()
 
     def _cleanupSharedMemory(self):
         self._sharedEnorm = None
