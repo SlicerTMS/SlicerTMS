@@ -258,7 +258,14 @@ class TMSService(rpyc.SlaveService):
             if len(parts) >= 4:
                 target_mm = np.array([float(parts[1]), float(parts[2]),
                                       float(parts[3])])
-                pending = self._optimize_coil(target_mm)
+                try:
+                    pending = self._optimize_coil(target_mm)
+                except Exception as exc:
+                    import traceback
+                    traceback.print_exc()
+                    print(f"OPTIMIZE_ERROR {exc}")
+                    sys.stdout.flush()
+                    pending = None
                 if pending is not None:
                     # Optimization was interrupted — process the pending cmd
                     return self._handle_command(
@@ -603,12 +610,13 @@ class TMSService(rpyc.SlaveService):
 
         cross_mr = np.cross(moment, r)                 # (N, 3)
 
-        # dL/d(pos_m) — two terms from d/dr[cross(m,r)/|r|^3]
+        # dL/d(pos_m) — two terms from d/d(pos)[C * cross(m,r)/|r|^3]
+        # where r = nodes - pos, so d(r)/d(pos) = -I
         # Term 1: -C * cross(m, dL_dAdt) / |r|^3
         term1 = -C * np.cross(moment, dL_dAdt) / r_norm3
-        # Term 2: +3C * cross(m,r) * (r . dL_dAdt) / |r|^5
-        r_dot_dLdA = np.sum(r * dL_dAdt, axis=1)[:, None]
-        term2 = 3 * C * cross_mr * r_dot_dLdA / r_norm5
+        # Term 2: +3C * r * (cross(m,r) . dL_dAdt) / |r|^5
+        crossmr_dot_dLdA = np.sum(cross_mr * dL_dAdt, axis=1)[:, None]
+        term2 = 3 * C * r * crossmr_dot_dLdA / r_norm5
         dL_dpos_m = (term1 + term2).sum(axis=0)
         dL_dpos_mm = dL_dpos_m * 1e-3  # chain: pos_m = pos_mm * 1e-3
 
