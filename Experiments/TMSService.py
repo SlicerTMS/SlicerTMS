@@ -721,6 +721,15 @@ class TMSService(rpyc.SlaveService):
         mat[:3, 3] = pos_mm
         return mat
 
+    def _warp_solve_to_convergence(self, dAdt, max_chunks=20):
+        """Run the warp GPU solver to convergence, return Enorm array."""
+        self._warp_ctx.set_rhs(dAdt)
+        for _ in range(max_chunks):
+            err, iters, converged = self._warp_ctx.step(n_iters=50)
+            if converged:
+                break
+        return self._warp_ctx.compute_enorm()
+
     def _optimize_coil(self, target_mm):
         """Run Adam optimization to maximize |E| at the target point.
 
@@ -729,34 +738,35 @@ class TMSService(rpyc.SlaveService):
         back to the nearest surface point + offset, and the moment direction
         is set to the outward surface normal.
 
+        Uses the warp GPU solver with finite-difference gradients when a warp
+        context is available (fast: ~2s per iteration on GPU).  Falls back to
+        numpy CG adjoint for the numpy solver.
+
         Returns a pending stdin command (str) if interrupted, else None.
         """
         from tmswarp.coil import magnetic_dipole_dadt
-        from tmswarp.solver import assemble_rhs_tms
-        from tmswarp.fields import compute_efield_at_elements
 
         print("OPTIMIZE_STATUS Preparing optimization...")
         sys.stdout.flush()
 
-        # Wait for background G/K prep thread (started at streaming init)
-        self._wait_for_numpy_prep()
+        use_warp = self._warp_ctx is not None
 
-        # Lazily build G and K (no factorization — use CG instead)
-        self._ensure_GK()
-        if self._K_reduced is None:
-            print("OPTIMIZE_ERROR cannot_build_stiffness_matrix")
-            sys.stdout.flush()
-            return None
+        if not use_warp:
+            # Numpy path: need G, K, and CG solver
+            self._wait_for_numpy_prep()
+            self._ensure_GK()
+            if self._K_reduced is None:
+                print("OPTIMIZE_ERROR cannot_build_stiffness_matrix")
+                sys.stdout.flush()
+                return None
+            self._cg_phi = None
+            self._cg_lam = None
 
         # Build scalp surface for projection if not yet done
         if self._surf_tree is None:
             self._build_surface_data()
 
         offset_m = 0.01  # 10 mm
-
-        # Reset CG warm-start for new target
-        self._cg_phi = None
-        self._cg_lam = None
 
         target_m = np.array(target_mm) * 1e-3
         target_elem = self._find_nearest_element(target_m)
@@ -770,16 +780,20 @@ class TMSService(rpyc.SlaveService):
         else:
             init_pos_m = target_m
         proj_pos_m, normal = self._project_to_surface(init_pos_m, offset_m)
-        params = np.concatenate([proj_pos_m * 1e3, normal])
 
-        # Adam optimizer state
+        # Optimize position only (3 params); moment = surface normal
+        pos_mm = proj_pos_m * 1e3
+        nodes = self.mesh.nodes
+
+        # Adam optimizer state (3 params: position in mm)
         lr = 2.0
-        beta1, beta2, eps = 0.9, 0.999, 1e-8
-        m_adam = np.zeros(6)
-        v_adam = np.zeros(6)
+        beta1, beta2, eps_adam = 0.9, 0.999, 1e-8
+        m_adam = np.zeros(3)
+        v_adam = np.zeros(3)
 
-        max_iters = 200
+        max_iters = 100
         prev_loss = None
+        fd_eps = 0.5  # mm for finite differences
 
         for iteration in range(max_iters):
             # Check for interruption
@@ -789,73 +803,134 @@ class TMSService(rpyc.SlaveService):
                     return "STOP"
                 return cmd  # OPTIMIZE or PROBE — caller handles
 
-            loss, grad = self._compute_objective_and_gradient(params, target_elem)
+            # Project current position and get surface normal
+            proj_pos_m, normal = self._project_to_surface(
+                pos_mm * 1e-3, offset_m
+            )
+            pos_mm = proj_pos_m * 1e3
+            moment_dir = normal
 
-            # Adam update
+            if use_warp:
+                # --- Warp GPU path: finite-difference gradient ---
+                # Base solve
+                dAdt = magnetic_dipole_dadt(
+                    pos_mm * 1e-3, moment_dir, DIDT, nodes
+                )
+                Enorm = self._warp_solve_to_convergence(dAdt)
+                loss = -float(Enorm[target_elem])
+
+                # FD gradient (3 position perturbations)
+                grad = np.zeros(3)
+                for i in range(3):
+                    p_pert = pos_mm.copy()
+                    p_pert[i] += fd_eps
+                    proj_pert_m, norm_pert = self._project_to_surface(
+                        p_pert * 1e-3, offset_m
+                    )
+                    dAdt_pert = magnetic_dipole_dadt(
+                        proj_pert_m, norm_pert, DIDT, nodes
+                    )
+                    Enorm_pert = self._warp_solve_to_convergence(dAdt_pert)
+                    loss_pert = -float(Enorm_pert[target_elem])
+                    grad[i] = (loss_pert - loss) / fd_eps
+            else:
+                # --- Numpy CG adjoint path ---
+                params = np.concatenate([pos_mm, normal])
+                loss, grad_full = self._compute_objective_and_gradient(
+                    params, target_elem
+                )
+                grad = grad_full[:3]  # position gradient only
+                Enorm = None
+
+            # Adam update (position only)
             t_adam = iteration + 1
             m_adam = beta1 * m_adam + (1 - beta1) * grad
             v_adam = beta2 * v_adam + (1 - beta2) * grad ** 2
             m_hat = m_adam / (1 - beta1 ** t_adam)
             v_hat = v_adam / (1 - beta2 ** t_adam)
-            params = params - lr * m_hat / (np.sqrt(v_hat) + eps)
+            pos_mm = pos_mm - lr * m_hat / (np.sqrt(v_hat) + eps_adam)
 
-            # Surface constraint: project position, set moment to normal
-            pos_m = params[:3] * 1e-3
-            proj_pos_m, normal = self._project_to_surface(pos_m, offset_m)
-            params[:3] = proj_pos_m * 1e3
-            params[3:6] = normal
+            # Update visualization every iteration for warp, every 5 for numpy
+            emit_viz = (use_warp and iteration % 2 == 0) or (
+                not use_warp and iteration % 5 == 0
+            ) or iteration == max_iters - 1
 
-            # Compute full E-field for visualization every few iterations
-            if iteration % 5 == 0 or iteration == max_iters - 1:
-                moment_dir = params[3:6] / np.linalg.norm(params[3:6])
-                dAdt = magnetic_dipole_dadt(
-                    params[:3] * 1e-3, moment_dir, DIDT, self.mesh.nodes
+            if emit_viz:
+                if use_warp:
+                    # Warp already computed Enorm at the base solve
+                    if self._sharedEnorm is not None:
+                        self._sharedEnorm[:] = Enorm
+                else:
+                    # Numpy: do a full E-field solve for viz
+                    from tmswarp.solver import assemble_rhs_tms
+                    from tmswarp.fields import compute_efield_at_elements
+                    proj_pos_m, normal = self._project_to_surface(
+                        pos_mm * 1e-3, offset_m
+                    )
+                    dAdt = magnetic_dipole_dadt(
+                        proj_pos_m, normal, DIDT, nodes
+                    )
+                    b = assemble_rhs_tms(self.mesh, dAdt, self._G)
+                    phi = np.zeros(len(nodes), dtype=np.float64)
+                    phi[1:] = self._cg_solve(b[1:], x0=self._cg_phi)
+                    self._cg_phi = phi[1:].copy()
+                    self.E = compute_efield_at_elements(
+                        self.mesh, phi, dAdt, self._G
+                    )
+                    if self._sharedEnorm is not None:
+                        self._sharedEnorm[:] = np.linalg.norm(self.E, axis=1)
+
+                # Emit probe position and status
+                proj_pos_m, normal = self._project_to_surface(
+                    pos_mm * 1e-3, offset_m
                 )
-                b = assemble_rhs_tms(self.mesh, dAdt, self._G)
-                phi = np.zeros(len(self.mesh.nodes), dtype=np.float64)
-                phi[1:] = self._cg_solve(b[1:], x0=self._cg_phi)
-                self._cg_phi = phi[1:].copy()
-                self.E = compute_efield_at_elements(
-                    self.mesh, phi, dAdt, self._G
-                )
-                self._dAdt = dAdt
-                if self._sharedEnorm is not None:
-                    self._sharedEnorm[:] = np.linalg.norm(self.E, axis=1)
-
-                # Emit current probe position and E-field update
-                mat = self._params_to_matrix(params)
+                params_for_mat = np.concatenate([proj_pos_m * 1e3, normal])
+                mat = self._params_to_matrix(params_for_mat)
                 vals = " ".join(f"{v:.6f}" for v in mat.ravel())
                 print(f"OPT_PROBE {vals}")
                 Enorm_val = -loss
-                print(f"OPTIMIZE_STATUS iter {iteration}/{max_iters}  |E|={Enorm_val:.2f} V/m")
-                print(f"E_UPDATED iter={iteration} loss={loss:.6e} converged=0")
+                print(
+                    f"OPTIMIZE_STATUS iter {iteration}/{max_iters}"
+                    f"  |E|={Enorm_val:.2f} V/m"
+                )
+                print(
+                    f"E_UPDATED iter={iteration} loss={loss:.6e} converged=0"
+                )
                 sys.stdout.flush()
 
             # Convergence check
-            if prev_loss is not None and abs(loss - prev_loss) < 1e-8:
+            if prev_loss is not None and abs(loss - prev_loss) < 1e-3:
                 break
             prev_loss = loss
 
-        # Final full solve and emit
-        moment_dir = params[3:6] / np.linalg.norm(params[3:6])
-        dAdt = magnetic_dipole_dadt(
-            params[:3] * 1e-3, moment_dir, DIDT, self.mesh.nodes
-        )
-        b = assemble_rhs_tms(self.mesh, dAdt, self._G)
-        phi = np.zeros(len(self.mesh.nodes), dtype=np.float64)
-        phi[1:] = self._cg_solve(b[1:], x0=self._cg_phi)
-        self._cg_phi = phi[1:].copy()
-        self.E = compute_efield_at_elements(self.mesh, phi, dAdt, self._G)
+        # --- Final solve & emit ---
+        proj_pos_m, normal = self._project_to_surface(pos_mm * 1e-3, offset_m)
+        dAdt = magnetic_dipole_dadt(proj_pos_m, normal, DIDT, nodes)
+        if use_warp:
+            Enorm = self._warp_solve_to_convergence(dAdt)
+            if self._sharedEnorm is not None:
+                self._sharedEnorm[:] = Enorm
+        else:
+            from tmswarp.solver import assemble_rhs_tms
+            from tmswarp.fields import compute_efield_at_elements
+            b = assemble_rhs_tms(self.mesh, dAdt, self._G)
+            phi = np.zeros(len(nodes), dtype=np.float64)
+            phi[1:] = self._cg_solve(b[1:], x0=self._cg_phi)
+            self.E = compute_efield_at_elements(self.mesh, phi, dAdt, self._G)
+            if self._sharedEnorm is not None:
+                self._sharedEnorm[:] = np.linalg.norm(self.E, axis=1)
         self._dAdt = dAdt
-        if self._sharedEnorm is not None:
-            self._sharedEnorm[:] = np.linalg.norm(self.E, axis=1)
 
-        mat = self._params_to_matrix(params)
+        params_for_mat = np.concatenate([proj_pos_m * 1e3, normal])
+        mat = self._params_to_matrix(params_for_mat)
         self._last_probe_mat = mat
         vals = " ".join(f"{v:.6f}" for v in mat.ravel())
         Enorm_val = -loss
         print(f"OPT_PROBE {vals}")
-        print(f"OPTIMIZE_STATUS Done — |E|={Enorm_val:.2f} V/m after {iteration+1} iterations")
+        print(
+            f"OPTIMIZE_STATUS Done — |E|={Enorm_val:.2f} V/m"
+            f" after {iteration+1} iterations"
+        )
         print(f"OPTIMIZE_DONE iter={iteration} loss={loss:.6e}")
         sys.stdout.flush()
         return None
