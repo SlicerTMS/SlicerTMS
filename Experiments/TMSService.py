@@ -480,7 +480,7 @@ class TMSService(rpyc.SlaveService):
             (n, n),
             matvec=lambda v: self._K_diag_inv * v,
         )
-        x, info = cg(self._K_reduced, rhs_reduced, x0=x0, tol=tol,
+        x, info = cg(self._K_reduced, rhs_reduced, x0=x0, rtol=tol,
                       maxiter=maxiter, M=M)
         return x
 
