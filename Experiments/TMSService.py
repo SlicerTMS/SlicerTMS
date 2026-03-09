@@ -32,6 +32,7 @@ import multiprocessing.shared_memory
 import os
 import select
 import sys
+import threading
 
 import numpy as np
 
@@ -82,6 +83,12 @@ class TMSService(rpyc.SlaveService):
         self._surf_centers = None    # (F, 3) boundary face centers (meters)
         self._surf_normals = None    # (F, 3) outward face normals
         self._surf_tree = None       # cKDTree for nearest-surface queries
+        self._numpy_prep_thread = None  # background thread for G/K assembly
+        self._numpy_prep_error = None   # exception from background thread
+        self._K_reduced = None       # K[1:,1:] for CG solves
+        self._K_diag_inv = None      # Jacobi preconditioner (1/diag(K_reduced))
+        self._cg_phi = None          # warm-start for forward CG
+        self._cg_lam = None          # warm-start for adjoint CG
 
     # ------------------------------------------------------------------
     # Public API
@@ -244,6 +251,15 @@ class TMSService(rpyc.SlaveService):
         # Publish the initial E-field so the mesh shows colors immediately
         if self.E is not None:
             self._sharedEnorm[:] = np.linalg.norm(self.E, axis=1)
+
+        # Pre-build numpy prerequisites in background (for optimization).
+        # The factorization is C code (UMFPACK/SuperLU) that releases the GIL,
+        # so it won't block the Python solve loop.
+        if self._solver in ("warp_cpu", "warp_gpu") and self._K_factor is None:
+            self._numpy_prep_thread = threading.Thread(
+                target=self._background_numpy_prep, daemon=True
+            )
+            self._numpy_prep_thread.start()
 
         print(f"STREAMING_READY solver={self._solver}")
         sys.stdout.flush()
@@ -409,18 +425,68 @@ class TMSService(rpyc.SlaveService):
     # Coil position optimization (adjoint-based)
     # ------------------------------------------------------------------
 
-    def _ensure_numpy_prerequisites(self):
-        """Lazily build gradient operator, stiffness matrix, and LU factor."""
+    def _background_numpy_prep(self):
+        """Build G and K in a background thread (no LU factorization)."""
+        try:
+            self._ensure_GK()
+        except Exception as exc:
+            self._numpy_prep_error = exc
+            print(f"OPTIMIZE_STATUS Error preparing solver: {exc}")
+            sys.stdout.flush()
+
+    def _wait_for_numpy_prep(self):
+        """Wait for the background numpy prep thread to finish, if running."""
+        t = self._numpy_prep_thread
+        if t is not None and t.is_alive():
+            print("OPTIMIZE_STATUS Waiting for solver preparation to finish...")
+            sys.stdout.flush()
+            t.join()
+        self._numpy_prep_thread = None
+        if self._numpy_prep_error is not None:
+            raise RuntimeError(
+                f"Background solver preparation failed: {self._numpy_prep_error}"
+            )
+
+    def _ensure_GK(self):
+        """Lazily build gradient operator and stiffness matrix (no factorization)."""
         if self._G is None:
             from tmswarp.solver import gradient_operator
-            print("Building gradient operator for optimization ...")
+            print("OPTIMIZE_STATUS Building gradient operator...")
             sys.stdout.flush()
             self._G = gradient_operator(self.mesh)
         if self._K is None:
             from tmswarp.solver import assemble_stiffness
-            print("Assembling stiffness matrix ...")
+            print("OPTIMIZE_STATUS Assembling stiffness matrix...")
             sys.stdout.flush()
             self._K = assemble_stiffness(self.mesh, self._G)
+            # Build reduced system and Jacobi preconditioner for CG
+            K_csr = self._K.tocsr()
+            self._K_reduced = K_csr[1:, 1:].tocsc()
+            diag = self._K_reduced.diagonal()
+            diag = np.where(np.abs(diag) > 1e-30, diag, 1.0)
+            self._K_diag_inv = 1.0 / diag
+            print("OPTIMIZE_STATUS Solver ready (CG mode)")
+            sys.stdout.flush()
+
+    def _cg_solve(self, rhs_reduced, x0=None, tol=1e-6, maxiter=2000):
+        """Solve K_reduced @ x = rhs_reduced using CG with Jacobi preconditioner.
+
+        Returns the solution vector x (same size as rhs_reduced).
+        """
+        from scipy.sparse.linalg import cg, LinearOperator
+
+        n = len(rhs_reduced)
+        M = LinearOperator(
+            (n, n),
+            matvec=lambda v: self._K_diag_inv * v,
+        )
+        x, info = cg(self._K_reduced, rhs_reduced, x0=x0, tol=tol,
+                      maxiter=maxiter, M=M)
+        return x
+
+    def _ensure_numpy_prerequisites(self):
+        """Lazily build gradient operator, stiffness matrix, and LU factor."""
+        self._ensure_GK()
         if self._K_factor is None:
             self._prefactorize_K()
 
@@ -433,7 +499,7 @@ class TMSService(rpyc.SlaveService):
         """
         from scipy.spatial import cKDTree
 
-        print("Building scalp surface for optimization constraint ...")
+        print("OPTIMIZE_STATUS Building scalp surface for constraint...")
         sys.stdout.flush()
 
         elems = self.mesh.elements   # (M, 4)
@@ -555,7 +621,8 @@ class TMSService(rpyc.SlaveService):
         dAdt = magnetic_dipole_dadt(pos_m, moment, DIDT, nodes)
         b = assemble_rhs_tms(self.mesh, dAdt, G)
         phi = np.zeros(len(nodes), dtype=np.float64)
-        phi[1:] = self._K_factor(b[1:])
+        phi[1:] = self._cg_solve(b[1:], x0=self._cg_phi)
+        self._cg_phi = phi[1:].copy()
 
         # E at target element
         phi_t = phi[t_nodes]                          # (4,)
@@ -578,9 +645,10 @@ class TMSService(rpyc.SlaveService):
         for i in range(4):
             dL_dphi[t_nodes[i]] += dL_dE @ (-G_t[i])
 
-        # Step 3: adjoint solve (reuse pre-factored K!)
+        # Step 3: adjoint solve (CG with Jacobi preconditioner)
         lam = np.zeros(len(nodes), dtype=np.float64)
-        lam[1:] = self._K_factor(dL_dphi[1:])
+        lam[1:] = self._cg_solve(dL_dphi[1:], x0=self._cg_lam)
+        self._cg_lam = lam[1:].copy()
 
         # Step 4: dL/d(dAdt_nodes) via b (adjoint contribution)
         # "Gradient of lambda" at each element
@@ -667,10 +735,16 @@ class TMSService(rpyc.SlaveService):
         from tmswarp.solver import assemble_rhs_tms
         from tmswarp.fields import compute_efield_at_elements
 
-        # Lazily build numpy prerequisites (works even when main solver is warp)
-        self._ensure_numpy_prerequisites()
-        if self._K_factor is None:
-            print("OPTIMIZE_ERROR cannot_build_numpy_solver")
+        print("OPTIMIZE_STATUS Preparing optimization...")
+        sys.stdout.flush()
+
+        # Wait for background G/K prep thread (started at streaming init)
+        self._wait_for_numpy_prep()
+
+        # Lazily build G and K (no factorization — use CG instead)
+        self._ensure_GK()
+        if self._K_reduced is None:
+            print("OPTIMIZE_ERROR cannot_build_stiffness_matrix")
             sys.stdout.flush()
             return None
 
@@ -680,10 +754,14 @@ class TMSService(rpyc.SlaveService):
 
         offset_m = 0.01  # 10 mm
 
+        # Reset CG warm-start for new target
+        self._cg_phi = None
+        self._cg_lam = None
+
         target_m = np.array(target_mm) * 1e-3
         target_elem = self._find_nearest_element(target_m)
         tag_str = str(self._tag1[target_elem]) if self._tag1 is not None else "?"
-        print(f"Optimizing for element {target_elem} (tag={tag_str})")
+        print(f"OPTIMIZE_STATUS Optimizing for element {target_elem} (tag={tag_str})")
         sys.stdout.flush()
 
         # Initialize: project current position (or target) to surface + offset
@@ -735,7 +813,8 @@ class TMSService(rpyc.SlaveService):
                 )
                 b = assemble_rhs_tms(self.mesh, dAdt, self._G)
                 phi = np.zeros(len(self.mesh.nodes), dtype=np.float64)
-                phi[1:] = self._K_factor(b[1:])
+                phi[1:] = self._cg_solve(b[1:], x0=self._cg_phi)
+                self._cg_phi = phi[1:].copy()
                 self.E = compute_efield_at_elements(
                     self.mesh, phi, dAdt, self._G
                 )
@@ -747,6 +826,8 @@ class TMSService(rpyc.SlaveService):
                 mat = self._params_to_matrix(params)
                 vals = " ".join(f"{v:.6f}" for v in mat.ravel())
                 print(f"OPT_PROBE {vals}")
+                Enorm_val = -loss
+                print(f"OPTIMIZE_STATUS iter {iteration}/{max_iters}  |E|={Enorm_val:.2f} V/m")
                 print(f"E_UPDATED iter={iteration} loss={loss:.6e} converged=0")
                 sys.stdout.flush()
 
@@ -762,7 +843,8 @@ class TMSService(rpyc.SlaveService):
         )
         b = assemble_rhs_tms(self.mesh, dAdt, self._G)
         phi = np.zeros(len(self.mesh.nodes), dtype=np.float64)
-        phi[1:] = self._K_factor(b[1:])
+        phi[1:] = self._cg_solve(b[1:], x0=self._cg_phi)
+        self._cg_phi = phi[1:].copy()
         self.E = compute_efield_at_elements(self.mesh, phi, dAdt, self._G)
         self._dAdt = dAdt
         if self._sharedEnorm is not None:
@@ -771,7 +853,9 @@ class TMSService(rpyc.SlaveService):
         mat = self._params_to_matrix(params)
         self._last_probe_mat = mat
         vals = " ".join(f"{v:.6f}" for v in mat.ravel())
+        Enorm_val = -loss
         print(f"OPT_PROBE {vals}")
+        print(f"OPTIMIZE_STATUS Done — |E|={Enorm_val:.2f} V/m after {iteration+1} iterations")
         print(f"OPTIMIZE_DONE iter={iteration} loss={loss:.6e}")
         sys.stdout.flush()
         return None

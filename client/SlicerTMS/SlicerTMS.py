@@ -381,6 +381,9 @@ class SlicerTMSWidget(ScriptedLoadableModuleWidget):
 
         self.layout.addStretch(1)
 
+        # Wire optimization status callback so the logic can update the label
+        self.logic._optStatusCallback = lambda msg: self.optStatusLabel.setText(msg)
+
         # Auto-detect mesh and set solver availability on startup
         self._autoDetectMesh()
         self._updateSolverAvailability()
@@ -611,6 +614,7 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         self._optimizing       = False
         self._optTargetNode    = None   # vtkMRMLMarkupsFiducialNode
         self._optTargetObsTag  = None
+        self._optStatusCallback = None  # callable(str) — set by widget for status updates
         # QProcess signal slots (stored to prevent GC)
         self._onStateChangedSlot = None
         self._onReadyReadOutSlot = None
@@ -1138,6 +1142,12 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             'finished(int,QProcess::ExitStatus)', self._onFinishedSlot
         )
 
+        # Ensure unbuffered stdout from the subprocess so status messages
+        # arrive in real time, even through the PythonSlicer wrapper pipe.
+        env = qt.QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONUNBUFFERED", "1")
+        self._process.setProcessEnvironment(env)
+
         # Launch
         self._process.start(sys.executable, [
             _SERVICE_PATH,
@@ -1171,13 +1181,20 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
                 log.info(f"[TMSService] {line}")
                 if line.startswith("OPT_PROBE"):
                     self._handleOptProbe(line)
+                elif line.startswith("OPTIMIZE_STATUS"):
+                    msg = line[len("OPTIMIZE_STATUS"):].strip()
+                    if self._optStatusCallback:
+                        self._optStatusCallback(msg)
                 elif line.startswith("OPTIMIZE_DONE"):
                     self._optimizing = False
                     log.info("Optimization converged")
                     needs_update = True
                 elif line.startswith("OPTIMIZE_ERROR"):
                     self._optimizing = False
-                    log.warning(f"Optimization error: {line}")
+                    msg = line[len("OPTIMIZE_ERROR"):].strip()
+                    log.warning(f"Optimization error: {msg}")
+                    if self._optStatusCallback:
+                        self._optStatusCallback(f"Error: {msg}")
                 elif (line.startswith("E_UPDATED") or line.startswith("STREAMING_READY")) \
                         and self._sharedEnorm is not None:
                     needs_update = True
@@ -1717,6 +1734,8 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
                 node.RemoveNthControlPoint(i)
 
         self._optimizing = True
+        if self._optStatusCallback:
+            self._optStatusCallback(f"Target: [{pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}] — starting...")
         cmd = f"OPTIMIZE {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}\n"
         self._process.write(cmd.encode("utf-8"))
         log.info(f"Sent OPTIMIZE target=[{pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}]")
