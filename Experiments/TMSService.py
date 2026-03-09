@@ -793,7 +793,7 @@ class TMSService(rpyc.SlaveService):
 
         max_iters = 100
         prev_loss = None
-        fd_eps = 0.5  # mm for finite differences
+        fd_eps = 1.0  # mm for finite differences
 
         for iteration in range(max_iters):
             # Check for interruption
@@ -820,15 +820,14 @@ class TMSService(rpyc.SlaveService):
                 loss = -float(Enorm[target_elem])
 
                 # FD gradient (3 position perturbations)
+                # Perturb coil position directly — do NOT re-project,
+                # otherwise the KDTree snaps to the same face → zero gradient.
                 grad = np.zeros(3)
                 for i in range(3):
-                    p_pert = pos_mm.copy()
-                    p_pert[i] += fd_eps
-                    proj_pert_m, norm_pert = self._project_to_surface(
-                        p_pert * 1e-3, offset_m
-                    )
+                    pos_pert_m = (pos_mm * 1e-3).copy()
+                    pos_pert_m[i] += fd_eps * 1e-3
                     dAdt_pert = magnetic_dipole_dadt(
-                        proj_pert_m, norm_pert, DIDT, nodes
+                        pos_pert_m, moment_dir, DIDT, nodes
                     )
                     Enorm_pert = self._warp_solve_to_convergence(dAdt_pert)
                     loss_pert = -float(Enorm_pert[target_elem])
