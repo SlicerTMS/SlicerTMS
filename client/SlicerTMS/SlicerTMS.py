@@ -1441,10 +1441,11 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
                 dn.SetGlyphScale(3.0)
                 dn.SetSelectedColor(1.0, 0.5, 0.0)
             if self._fiducialObsTag is None:
-                self._fiducialObsTag = self._fiducialNode.AddObserver(
-                    slicer.vtkMRMLMarkupsNode.PointModifiedEvent,
-                    self._onFiducialMoved,
-                )
+                self._fiducialObsTag = []
+                for evt in (slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent,
+                            slicer.vtkMRMLMarkupsNode.PointEndInteractionEvent):
+                    tag = self._fiducialNode.AddObserver(evt, self._onFiducialMoved)
+                    self._fiducialObsTag.append(tag)
             # Enter persistent place mode for this fiducial
             interactionNode = slicer.app.applicationLogic().GetInteractionNode()
             selectionNode = slicer.app.applicationLogic().GetSelectionNode()
@@ -1456,7 +1457,8 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             log.info("Head-following mode enabled")
         else:
             if self._fiducialNode is not None and self._fiducialObsTag is not None:
-                self._fiducialNode.RemoveObserver(self._fiducialObsTag)
+                for tag in self._fiducialObsTag:
+                    self._fiducialNode.RemoveObserver(tag)
                 self._fiducialObsTag = None
             interactionNode = slicer.app.applicationLogic().GetInteractionNode()
             interactionNode.SetCurrentInteractionMode(interactionNode.ViewTransform)
@@ -1467,16 +1469,20 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         if not self._headFollowing:
             return
         node = caller
-        nPts = node.GetNumberOfControlPoints()
-        if nPts == 0:
+        # Find the last defined (placed) control point
+        lastDefined = -1
+        for i in range(node.GetNumberOfControlPoints()):
+            if node.GetNthControlPointPositionStatus(i) == node.PositionDefined:
+                lastDefined = i
+        if lastDefined < 0:
             return
-        # Keep only the last control point
-        while nPts > 1:
-            node.RemoveNthControlPoint(0)
-            nPts = node.GetNumberOfControlPoints()
-
+        # Get position of the last defined point before removing extras
         pos = [0.0, 0.0, 0.0]
-        node.GetNthControlPointPositionWorld(0, pos)
+        node.GetNthControlPointPositionWorld(lastDefined, pos)
+        # Remove older defined points (keep only the most recent)
+        for i in range(lastDefined - 1, -1, -1):
+            if node.GetNthControlPointPositionStatus(i) == node.PositionDefined:
+                node.RemoveNthControlPoint(i)
 
         closestPoint, normal = self._computeSurfaceNormalAtPoint(pos)
         if closestPoint is None:
@@ -1664,10 +1670,11 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
                 dn.SetGlyphScale(4.0)
                 dn.SetSelectedColor(0.0, 1.0, 0.0)  # green
             if self._optTargetObsTag is None:
-                self._optTargetObsTag = self._optTargetNode.AddObserver(
-                    slicer.vtkMRMLMarkupsNode.PointModifiedEvent,
-                    self._onOptTargetMoved,
-                )
+                self._optTargetObsTag = []
+                for evt in (slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent,
+                            slicer.vtkMRMLMarkupsNode.PointEndInteractionEvent):
+                    tag = self._optTargetNode.AddObserver(evt, self._onOptTargetMoved)
+                    self._optTargetObsTag.append(tag)
             # Enter persistent place mode
             interactionNode = slicer.app.applicationLogic().GetInteractionNode()
             selectionNode = slicer.app.applicationLogic().GetSelectionNode()
@@ -1679,7 +1686,8 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
             log.info("Optimization mode enabled")
         else:
             if self._optTargetNode is not None and self._optTargetObsTag is not None:
-                self._optTargetNode.RemoveObserver(self._optTargetObsTag)
+                for tag in self._optTargetObsTag:
+                    self._optTargetNode.RemoveObserver(tag)
                 self._optTargetObsTag = None
             interactionNode = slicer.app.applicationLogic().GetInteractionNode()
             interactionNode.SetCurrentInteractionMode(interactionNode.ViewTransform)
@@ -1690,16 +1698,21 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
         if self._process is None:
             return
         node = caller
-        nPts = node.GetNumberOfControlPoints()
-        if nPts == 0:
+        # Find the last defined (placed) control point
+        lastDefined = -1
+        for i in range(node.GetNumberOfControlPoints()):
+            if node.GetNthControlPointPositionStatus(i) == node.PositionDefined:
+                lastDefined = i
+        if lastDefined < 0:
             return
-        # Keep only the last control point
-        while nPts > 1:
-            node.RemoveNthControlPoint(0)
-            nPts = node.GetNumberOfControlPoints()
 
         pos = [0.0, 0.0, 0.0]
-        node.GetNthControlPointPositionWorld(0, pos)
+        node.GetNthControlPointPositionWorld(lastDefined, pos)
+        # Remove older defined points (keep only the most recent)
+        for i in range(lastDefined - 1, -1, -1):
+            if node.GetNthControlPointPositionStatus(i) == node.PositionDefined:
+                node.RemoveNthControlPoint(i)
+
         self._optimizing = True
         cmd = f"OPTIMIZE {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}\n"
         self._process.write(cmd.encode("utf-8"))
