@@ -1175,6 +1175,9 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
                     self._optimizing = False
                     log.info("Optimization converged")
                     needs_update = True
+                elif line.startswith("OPTIMIZE_ERROR"):
+                    self._optimizing = False
+                    log.warning(f"Optimization error: {line}")
                 elif (line.startswith("E_UPDATED") or line.startswith("STREAMING_READY")) \
                         and self._sharedEnorm is not None:
                     needs_update = True

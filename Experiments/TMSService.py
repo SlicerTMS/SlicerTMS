@@ -79,6 +79,9 @@ class TMSService(rpyc.SlaveService):
         self._barycenters = None  # (M, 3) element barycenters (meters)
         self._elem_weights = None # (M,) sigma*vol per element
         self._last_probe_mat = None  # last 4x4 probe matrix (for optimization init)
+        self._surf_centers = None    # (F, 3) boundary face centers (meters)
+        self._surf_normals = None    # (F, 3) outward face normals
+        self._surf_tree = None       # cKDTree for nearest-surface queries
 
     # ------------------------------------------------------------------
     # Public API
@@ -399,6 +402,82 @@ class TMSService(rpyc.SlaveService):
     # Coil position optimization (adjoint-based)
     # ------------------------------------------------------------------
 
+    def _ensure_numpy_prerequisites(self):
+        """Lazily build gradient operator, stiffness matrix, and LU factor."""
+        if self._G is None:
+            from tmswarp.solver import gradient_operator
+            print("Building gradient operator for optimization ...")
+            sys.stdout.flush()
+            self._G = gradient_operator(self.mesh)
+        if self._K is None:
+            from tmswarp.solver import assemble_stiffness
+            print("Assembling stiffness matrix ...")
+            sys.stdout.flush()
+            self._K = assemble_stiffness(self.mesh, self._G)
+        if self._K_factor is None:
+            self._prefactorize_K()
+
+    def _build_surface_data(self):
+        """Extract outer mesh boundary faces for surface-constraint projection.
+
+        Finds faces belonging to exactly one tetrahedron (the mesh boundary),
+        computes their centers and outward normals, and builds a KDTree for
+        fast nearest-point queries.
+        """
+        from scipy.spatial import cKDTree
+
+        print("Building scalp surface for optimization constraint ...")
+        sys.stdout.flush()
+
+        elems = self.mesh.elements   # (M, 4)
+        nodes = self.mesh.nodes      # (N, 3)
+
+        # Each tet has 4 triangular faces
+        face_idx = np.array([[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]])
+        all_faces = elems[:, face_idx].reshape(-1, 3)
+        all_faces.sort(axis=1)
+
+        # Encode as single int64 for fast unique-counting
+        mx = int(elems.max()) + 1
+        face_ids = (all_faces[:, 0].astype(np.int64) * mx * mx
+                    + all_faces[:, 1].astype(np.int64) * mx
+                    + all_faces[:, 2].astype(np.int64))
+        _, inv, cnt = np.unique(face_ids, return_inverse=True, return_counts=True)
+        bnd_mask = cnt[inv] == 1
+        bnd_faces = all_faces[bnd_mask]
+
+        # Face geometry
+        v0 = nodes[bnd_faces[:, 0]]
+        v1 = nodes[bnd_faces[:, 1]]
+        v2 = nodes[bnd_faces[:, 2]]
+        centers = (v0 + v1 + v2) / 3.0
+        normals = np.cross(v1 - v0, v2 - v0)
+        norms = np.linalg.norm(normals, axis=1, keepdims=True)
+        normals /= np.maximum(norms, 1e-12)
+
+        # Orient outward (away from mesh centroid)
+        mesh_ctr = nodes.mean(axis=0)
+        flip = np.sum(normals * (centers - mesh_ctr), axis=1) < 0
+        normals[flip] *= -1
+
+        self._surf_centers = centers
+        self._surf_normals = normals
+        self._surf_tree = cKDTree(centers)
+        print(f"  {len(bnd_faces)} boundary faces extracted.")
+        sys.stdout.flush()
+
+    def _project_to_surface(self, pos_m, offset_m=0.01):
+        """Project a point to the nearest surface face + offset along normal.
+
+        Returns (projected_position_m, outward_normal).
+        """
+        if self._surf_tree is None:
+            self._build_surface_data()
+        _, idx = self._surf_tree.query(pos_m)
+        sp = self._surf_centers[idx]
+        sn = self._surf_normals[idx]
+        return sp + offset_m * sn, sn
+
     def _find_nearest_element(self, target_m):
         """Find the brain element nearest to a target point (in meters).
 
@@ -569,34 +648,43 @@ class TMSService(rpyc.SlaveService):
     def _optimize_coil(self, target_mm):
         """Run Adam optimization to maximize |E| at the target point.
 
+        The coil is constrained to stay on the scalp surface with a fixed
+        offset (10 mm).  After each gradient step the position is projected
+        back to the nearest surface point + offset, and the moment direction
+        is set to the outward surface normal.
+
         Returns a pending stdin command (str) if interrupted, else None.
         """
         from tmswarp.coil import magnetic_dipole_dadt
         from tmswarp.solver import assemble_rhs_tms
         from tmswarp.fields import compute_efield_at_elements
 
-        # Ensure numpy backend prerequisites
-        if self._K_factor is None or self._G is None:
-            print("OPTIMIZE_ERROR: numpy solver not initialized")
+        # Lazily build numpy prerequisites (works even when main solver is warp)
+        self._ensure_numpy_prerequisites()
+        if self._K_factor is None:
+            print("OPTIMIZE_ERROR cannot_build_numpy_solver")
             sys.stdout.flush()
             return None
 
+        # Build scalp surface for projection if not yet done
+        if self._surf_tree is None:
+            self._build_surface_data()
+
+        offset_m = 0.01  # 10 mm
+
         target_m = np.array(target_mm) * 1e-3
         target_elem = self._find_nearest_element(target_m)
-        print(f"Optimizing for element {target_elem} "
-              f"(brain tag={self._tag1[target_elem] if self._tag1 is not None else '?'})")
+        tag_str = str(self._tag1[target_elem]) if self._tag1 is not None else "?"
+        print(f"Optimizing for element {target_elem} (tag={tag_str})")
         sys.stdout.flush()
 
-        # Initialize from current coil state or default
-        if self._dAdt is not None and self._last_probe_mat is not None:
-            mat = self._last_probe_mat
-            pos_mm = mat[:3, 3].copy()
-            moment = mat[:3, 2].copy()
+        # Initialize: project current position (or target) to surface + offset
+        if self._last_probe_mat is not None:
+            init_pos_m = self._last_probe_mat[:3, 3] * 1e-3
         else:
-            pos_mm = np.array([0.0, 0.0, 100.0])
-            moment = np.array([0.0, 0.0, 1.0])
-
-        params = np.concatenate([pos_mm, moment])
+            init_pos_m = target_m
+        proj_pos_m, normal = self._project_to_surface(init_pos_m, offset_m)
+        params = np.concatenate([proj_pos_m * 1e3, normal])
 
         # Adam optimizer state
         lr = 2.0
@@ -625,17 +713,18 @@ class TMSService(rpyc.SlaveService):
             v_hat = v_adam / (1 - beta2 ** t_adam)
             params = params - lr * m_hat / (np.sqrt(v_hat) + eps)
 
-            # Renormalize moment direction to stay on unit sphere
-            moment_norm = np.linalg.norm(params[3:6])
-            if moment_norm > 1e-12:
-                params[3:6] /= moment_norm
+            # Surface constraint: project position, set moment to normal
+            pos_m = params[:3] * 1e-3
+            proj_pos_m, normal = self._project_to_surface(pos_m, offset_m)
+            params[:3] = proj_pos_m * 1e3
+            params[3:6] = normal
 
             # Compute full E-field for visualization every few iterations
             if iteration % 5 == 0 or iteration == max_iters - 1:
-                pos_m = params[:3] * 1e-3
                 moment_dir = params[3:6] / np.linalg.norm(params[3:6])
-                dAdt = magnetic_dipole_dadt(pos_m, moment_dir, DIDT,
-                                            self.mesh.nodes)
+                dAdt = magnetic_dipole_dadt(
+                    params[:3] * 1e-3, moment_dir, DIDT, self.mesh.nodes
+                )
                 b = assemble_rhs_tms(self.mesh, dAdt, self._G)
                 phi = np.zeros(len(self.mesh.nodes), dtype=np.float64)
                 phi[1:] = self._K_factor(b[1:])
@@ -646,7 +735,7 @@ class TMSService(rpyc.SlaveService):
                 if self._sharedEnorm is not None:
                     self._sharedEnorm[:] = np.linalg.norm(self.E, axis=1)
 
-                # Emit current probe position
+                # Emit current probe position and E-field update
                 mat = self._params_to_matrix(params)
                 vals = " ".join(f"{v:.6f}" for v in mat.ravel())
                 print(f"OPT_PROBE {vals}")
@@ -659,9 +748,10 @@ class TMSService(rpyc.SlaveService):
             prev_loss = loss
 
         # Final full solve and emit
-        pos_m = params[:3] * 1e-3
         moment_dir = params[3:6] / np.linalg.norm(params[3:6])
-        dAdt = magnetic_dipole_dadt(pos_m, moment_dir, DIDT, self.mesh.nodes)
+        dAdt = magnetic_dipole_dadt(
+            params[:3] * 1e-3, moment_dir, DIDT, self.mesh.nodes
+        )
         b = assemble_rhs_tms(self.mesh, dAdt, self._G)
         phi = np.zeros(len(self.mesh.nodes), dtype=np.float64)
         phi[1:] = self._K_factor(b[1:])
