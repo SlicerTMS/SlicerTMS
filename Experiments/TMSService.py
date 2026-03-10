@@ -730,19 +730,48 @@ class TMSService(rpyc.SlaveService):
                 break
         return self._warp_ctx.compute_enorm()
 
+    def _generate_seed_positions(self, target_m, n_seeds=20):
+        """Generate spatially diverse candidate coil positions near *target_m*.
+
+        Uses farthest-point sampling over nearby surface face-centers so the
+        seeds cover a wide patch of scalp above the target, not just a tight
+        cluster around the nearest point.
+        """
+        k = min(n_seeds * 5, len(self._surf_centers))
+        _, idxs = self._surf_tree.query(target_m, k=k)
+
+        if len(idxs) <= n_seeds:
+            return list(idxs)
+
+        # Farthest-point sampling for spatial diversity
+        centers = self._surf_centers[idxs]
+        chosen = [0]  # start with the point nearest to target
+        min_dists = np.full(len(centers), np.inf)
+        for _ in range(n_seeds - 1):
+            d = np.linalg.norm(centers - centers[chosen[-1]], axis=1)
+            min_dists = np.minimum(min_dists, d)
+            for c in chosen:
+                min_dists[c] = -1  # exclude already chosen
+            chosen.append(int(np.argmax(min_dists)))
+
+        return [int(idxs[c]) for c in chosen]
+
     def _optimize_coil(self, target_mm):
-        """Run Adam optimization to maximize |E| at the target point.
+        """Run optimization to maximize |E| at the target point.
 
-        The coil is constrained to stay on the scalp surface with a fixed
-        offset (10 mm).  After each gradient step the position is projected
-        back to the nearest surface point + offset, and the moment direction
-        is set to the outward surface normal.
+        Two phases:
+          1. **Multi-start seeding** — evaluate diverse scalp positions near the
+             target and pick the best starting point.
+          2. **Adam refinement** — gradient-based optimization from the best seed,
+             with finite-difference gradients (warp GPU) or adjoint (numpy).
 
-        Uses the warp GPU solver with finite-difference gradients when a warp
-        context is available (fast: ~2s per iteration on GPU).  Falls back to
-        numpy CG adjoint for the numpy solver.
+        The coil is constrained to stay on the scalp surface + 10 mm offset.
+        Moment direction is set to the outward surface normal at each step.
 
-        Returns a pending stdin command (str) if interrupted, else None.
+        If a new OPTIMIZE or PROBE command arrives on stdin the method returns
+        it immediately so the caller can dispatch it.  ``_last_probe_mat`` is
+        updated during the loop so a subsequent call warm-starts from where
+        we left off.
         """
         from tmswarp.coil import magnetic_dipole_dadt
 
@@ -752,7 +781,6 @@ class TMSService(rpyc.SlaveService):
         use_warp = self._warp_ctx is not None
 
         if not use_warp:
-            # Numpy path: need G, K, and CG solver
             self._wait_for_numpy_prep()
             self._ensure_GK()
             if self._K_reduced is None:
@@ -762,48 +790,117 @@ class TMSService(rpyc.SlaveService):
             self._cg_phi = None
             self._cg_lam = None
 
-        # Build scalp surface for projection if not yet done
         if self._surf_tree is None:
             self._build_surface_data()
 
         offset_m = 0.01  # 10 mm
-
         target_m = np.array(target_mm) * 1e-3
         target_elem = self._find_nearest_element(target_m)
         tag_str = str(self._tag1[target_elem]) if self._tag1 is not None else "?"
         print(f"OPTIMIZE_STATUS Optimizing for element {target_elem} (tag={tag_str})")
         sys.stdout.flush()
 
-        # Initialize: project current position (or target) to surface + offset
-        if self._last_probe_mat is not None:
-            init_pos_m = self._last_probe_mat[:3, 3] * 1e-3
-        else:
-            init_pos_m = target_m
-        proj_pos_m, normal = self._project_to_surface(init_pos_m, offset_m)
-
-        # Optimize position only (3 params); moment = surface normal
-        pos_mm = proj_pos_m * 1e3
         nodes = self.mesh.nodes
 
-        # Adam optimizer state (3 params: position in mm)
+        # ==============================================================
+        # Phase 1: Multi-start seeding (warp GPU path only)
+        # ==============================================================
+        if use_warp:
+            seed_face_idxs = self._generate_seed_positions(target_m, n_seeds=20)
+            n_seeds = len(seed_face_idxs)
+
+            # Also include current coil position as a warm-start candidate
+            warm_start_pos_m = None
+            if self._last_probe_mat is not None:
+                warm_start_pos_m = self._last_probe_mat[:3, 3] * 1e-3
+
+            best_seed_loss = float('inf')
+            best_seed_pos_mm = None
+
+            for i, fidx in enumerate(seed_face_idxs):
+                cmd = self._drain_stdin_nonblocking()
+                if cmd is not None:
+                    return cmd
+
+                seed_m = (self._surf_centers[fidx]
+                          + offset_m * self._surf_normals[fidx])
+                norm = self._surf_normals[fidx]
+
+                dAdt = magnetic_dipole_dadt(seed_m, norm, DIDT, nodes)
+                Enorm = self._warp_solve_to_convergence(dAdt)
+                loss = -float(Enorm[target_elem])
+
+                if loss < best_seed_loss:
+                    best_seed_loss = loss
+                    best_seed_pos_mm = seed_m * 1e3
+
+                # Visual feedback: show probe at this candidate
+                if self._sharedEnorm is not None:
+                    self._sharedEnorm[:] = Enorm
+                p4m = np.concatenate([seed_m * 1e3, norm])
+                mat = self._params_to_matrix(p4m)
+                vals = " ".join(f"{v:.6f}" for v in mat.ravel())
+                print(f"OPT_PROBE {vals}")
+                print(
+                    f"OPTIMIZE_STATUS Seeding {i+1}/{n_seeds}:"
+                    f" best |E|={-best_seed_loss:.1f} V/m"
+                )
+                print(
+                    f"E_UPDATED iter=0 loss={loss:.6e} converged=0"
+                )
+                sys.stdout.flush()
+
+            # Evaluate the warm-start position too
+            if warm_start_pos_m is not None:
+                proj_m, norm = self._project_to_surface(
+                    warm_start_pos_m, offset_m
+                )
+                dAdt = magnetic_dipole_dadt(proj_m, norm, DIDT, nodes)
+                Enorm = self._warp_solve_to_convergence(dAdt)
+                loss = -float(Enorm[target_elem])
+                if loss < best_seed_loss:
+                    best_seed_loss = loss
+                    best_seed_pos_mm = proj_m * 1e3
+                    print(
+                        f"OPTIMIZE_STATUS Warm-start is best:"
+                        f" |E|={-best_seed_loss:.1f} V/m"
+                    )
+                    sys.stdout.flush()
+
+            pos_mm = best_seed_pos_mm
+            print(
+                f"OPTIMIZE_STATUS Best seed |E|={-best_seed_loss:.1f} V/m"
+                f" — refining..."
+            )
+            sys.stdout.flush()
+        else:
+            # Numpy: single start from current position
+            if self._last_probe_mat is not None:
+                init_pos_m = self._last_probe_mat[:3, 3] * 1e-3
+            else:
+                init_pos_m = target_m
+            proj_pos_m, normal = self._project_to_surface(init_pos_m, offset_m)
+            pos_mm = proj_pos_m * 1e3
+
+        # ==============================================================
+        # Phase 2: Adam gradient refinement
+        # ==============================================================
         lr = 2.0
         beta1, beta2, eps_adam = 0.9, 0.999, 1e-8
         m_adam = np.zeros(3)
         v_adam = np.zeros(3)
 
-        max_iters = 100
-        prev_loss = None
-        fd_eps = 1.0  # mm for finite differences
+        max_iters = 60
+        fd_eps = 1.0  # mm
+        best_loss = float('inf')
+        stall_count = 0
 
         for iteration in range(max_iters):
-            # Check for interruption
             cmd = self._drain_stdin_nonblocking()
             if cmd is not None:
-                if cmd == "STOP":
-                    return "STOP"
-                return cmd  # OPTIMIZE or PROBE — caller handles
+                return cmd
 
-            # Project current position and get surface normal
+            # Project to surface + offset
             proj_pos_m, normal = self._project_to_surface(
                 pos_mm * 1e-3, offset_m
             )
@@ -811,17 +908,13 @@ class TMSService(rpyc.SlaveService):
             moment_dir = normal
 
             if use_warp:
-                # --- Warp GPU path: finite-difference gradient ---
-                # Base solve
+                # --- Warp GPU: finite-difference gradient ---
                 dAdt = magnetic_dipole_dadt(
                     pos_mm * 1e-3, moment_dir, DIDT, nodes
                 )
                 Enorm = self._warp_solve_to_convergence(dAdt)
                 loss = -float(Enorm[target_elem])
 
-                # FD gradient (3 position perturbations)
-                # Perturb coil position directly — do NOT re-project,
-                # otherwise the KDTree snaps to the same face → zero gradient.
                 grad = np.zeros(3)
                 for i in range(3):
                     pos_pert_m = (pos_mm * 1e-3).copy()
@@ -833,12 +926,12 @@ class TMSService(rpyc.SlaveService):
                     loss_pert = -float(Enorm_pert[target_elem])
                     grad[i] = (loss_pert - loss) / fd_eps
             else:
-                # --- Numpy CG adjoint path ---
+                # --- Numpy CG adjoint ---
                 params = np.concatenate([pos_mm, normal])
                 loss, grad_full = self._compute_objective_and_gradient(
                     params, target_elem
                 )
-                grad = grad_full[:3]  # position gradient only
+                grad = grad_full[:3]
                 Enorm = None
 
             # Adam update (position only)
@@ -849,18 +942,23 @@ class TMSService(rpyc.SlaveService):
             v_hat = v_adam / (1 - beta2 ** t_adam)
             pos_mm = pos_mm - lr * m_hat / (np.sqrt(v_hat) + eps_adam)
 
-            # Update visualization every iteration for warp, every 5 for numpy
+            # Track improvement
+            if loss < best_loss - 0.1:
+                best_loss = loss
+                stall_count = 0
+            else:
+                stall_count += 1
+
+            # --- Visualization & status ---
             emit_viz = (use_warp and iteration % 2 == 0) or (
                 not use_warp and iteration % 5 == 0
             ) or iteration == max_iters - 1
 
             if emit_viz:
                 if use_warp:
-                    # Warp already computed Enorm at the base solve
                     if self._sharedEnorm is not None:
                         self._sharedEnorm[:] = Enorm
                 else:
-                    # Numpy: do a full E-field solve for viz
                     from tmswarp.solver import assemble_rhs_tms
                     from tmswarp.fields import compute_efield_at_elements
                     proj_pos_m, normal = self._project_to_surface(
@@ -879,30 +977,31 @@ class TMSService(rpyc.SlaveService):
                     if self._sharedEnorm is not None:
                         self._sharedEnorm[:] = np.linalg.norm(self.E, axis=1)
 
-                # Emit probe position and status
                 proj_pos_m, normal = self._project_to_surface(
                     pos_mm * 1e-3, offset_m
                 )
-                params_for_mat = np.concatenate([proj_pos_m * 1e3, normal])
-                mat = self._params_to_matrix(params_for_mat)
+                p4m = np.concatenate([proj_pos_m * 1e3, normal])
+                mat = self._params_to_matrix(p4m)
+                # Keep _last_probe_mat current so interruption warm-starts
+                self._last_probe_mat = mat
                 vals = " ".join(f"{v:.6f}" for v in mat.ravel())
                 print(f"OPT_PROBE {vals}")
-                Enorm_val = -loss
                 print(
                     f"OPTIMIZE_STATUS iter {iteration}/{max_iters}"
-                    f"  |E|={Enorm_val:.2f} V/m"
+                    f"  |E|={-loss:.2f} V/m  (best {-best_loss:.2f})"
                 )
                 print(
                     f"E_UPDATED iter={iteration} loss={loss:.6e} converged=0"
                 )
                 sys.stdout.flush()
 
-            # Convergence check
-            if prev_loss is not None and abs(loss - prev_loss) < 1e-3:
+            # Converge if stalled for 10 iterations
+            if stall_count >= 10:
                 break
-            prev_loss = loss
 
-        # --- Final solve & emit ---
+        # ==============================================================
+        # Final solve & emit
+        # ==============================================================
         proj_pos_m, normal = self._project_to_surface(pos_mm * 1e-3, offset_m)
         dAdt = magnetic_dipole_dadt(proj_pos_m, normal, DIDT, nodes)
         if use_warp:
@@ -920,17 +1019,16 @@ class TMSService(rpyc.SlaveService):
                 self._sharedEnorm[:] = np.linalg.norm(self.E, axis=1)
         self._dAdt = dAdt
 
-        params_for_mat = np.concatenate([proj_pos_m * 1e3, normal])
-        mat = self._params_to_matrix(params_for_mat)
+        p4m = np.concatenate([proj_pos_m * 1e3, normal])
+        mat = self._params_to_matrix(p4m)
         self._last_probe_mat = mat
         vals = " ".join(f"{v:.6f}" for v in mat.ravel())
-        Enorm_val = -loss
         print(f"OPT_PROBE {vals}")
         print(
-            f"OPTIMIZE_STATUS Done — |E|={Enorm_val:.2f} V/m"
-            f" after {iteration+1} iterations"
+            f"OPTIMIZE_STATUS Done — |E|={-best_loss:.2f} V/m"
+            f" after seeding + {iteration+1} iters"
         )
-        print(f"OPTIMIZE_DONE iter={iteration} loss={loss:.6e}")
+        print(f"OPTIMIZE_DONE iter={iteration} loss={best_loss:.6e}")
         sys.stdout.flush()
         return None
 
