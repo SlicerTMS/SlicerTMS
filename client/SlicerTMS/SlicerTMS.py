@@ -1894,6 +1894,399 @@ class SlicerTMSLogic(ScriptedLoadableModuleLogic):
 
 
 # ============================================================
+# .msh file reader plugin
+# ============================================================
+
+class SlicerTMSFileReader:
+    """Slicer I/O plugin for SimNIBS/Gmsh .msh FEM mesh files.
+
+    Automatically registered by Slicer because of the class-naming convention
+    <ModuleName>FileReader.
+
+    On load the reader:
+      1. Parses Gmsh v2 ASCII .msh files (as produced by SimNIBS / gmsh).
+      2. Creates a vtkMRMLModelNode backed by vtkUnstructuredGrid (all tets)
+         with Tag and Conductivity cell data arrays.
+      3. Creates one vtkMRMLModelNode per tissue surface for visualisation.
+      4. Saves a .npz sidecar file (same stem, same directory) that TMSService
+         can load directly via initialize_system().
+
+    Coordinate conventions
+    ----------------------
+    Gmsh / SimNIBS stores node coordinates in **millimetres**.
+    Slicer also uses mm internally, so model nodes are built from the raw
+    coordinates.  The .npz sidecar converts to **metres** (SI) for TMSWarp.
+    """
+
+    # SimNIBS default tissue conductivities (S/m), keyed by tag1 value.
+    _CONDUCTIVITY = {
+        1: 0.126,   # white matter
+        2: 0.275,   # gray matter
+        3: 1.654,   # CSF
+        4: 0.01,    # skull (compact bone)
+        5: 0.465,   # scalp / skin
+        6: 0.5,     # eye balls
+    }
+    _TISSUE_NAMES = {
+        1: "WhiteMatter",
+        2: "GrayMatter",
+        3: "CSF",
+        4: "Skull",
+        5: "Scalp",
+        6: "EyeBalls",
+    }
+
+    # SimNIBS surface-tag offset: surface triangles for tissue N carry tag N+1000
+    _SURFACE_OFFSET = 1000
+
+    # Gmsh element-type codes
+    _ETYPE_TRI = 2
+    _ETYPE_TET = 4
+
+    def __init__(self, parent):
+        self.parent = parent
+
+    def description(self):
+        return "SimNIBS/Gmsh FEM mesh"
+
+    def fileType(self):
+        return "GmshMesh"
+
+    def extensions(self):
+        return ["SimNIBS/Gmsh FEM mesh (*.msh)"]
+
+    def canLoadFile(self, filePath):
+        if not self.parent.supportedNameFilters(filePath):
+            return False
+        try:
+            with open(filePath, "rb") as fh:
+                return fh.readline().strip() == b"$MeshFormat"
+        except Exception:
+            return False
+
+    def load(self, properties):
+        try:
+            filePath = properties["fileName"]
+            baseName = properties.get(
+                "name",
+                os.path.splitext(os.path.basename(filePath))[0],
+            )
+
+            nodes_mm, tri_elems, tet_elems = self._parse_msh(filePath)
+
+            # --- .npz sidecar for TMSService ---
+            npz_path = os.path.splitext(filePath)[0] + ".npz"
+            self._save_npz(npz_path, nodes_mm, tet_elems)
+
+            loaded_ids = []
+
+            # --- unstructured grid model with all tets (primary physics mesh) ---
+            if tet_elems:
+                name = slicer.mrmlScene.GenerateUniqueName(f"{baseName}_mesh")
+                node = self._build_tet_model(nodes_mm, tet_elems, name)
+                if node:
+                    loaded_ids.append(node.GetID())
+
+            # --- surface model nodes for visualisation ---
+            tri_by_tissue = {}
+            for e in tri_elems:
+                tag = e["tag"]
+                tissue = tag - self._SURFACE_OFFSET if tag > self._SURFACE_OFFSET else tag
+                tri_by_tissue.setdefault(tissue, []).append(e["nodes"])
+
+            for tissue_tag in sorted(tri_by_tissue):
+                tris = tri_by_tissue[tissue_tag]
+                label = self._TISSUE_NAMES.get(tissue_tag, f"tissue{tissue_tag}")
+                name = slicer.mrmlScene.GenerateUniqueName(f"{baseName}_{label}")
+                node = self._build_model(nodes_mm, tris, name)
+                if node:
+                    loaded_ids.append(node.GetID())
+
+            # If no surface triangles, extract boundary faces from tet mesh
+            if len(loaded_ids) <= 1 and tet_elems:
+                boundary = self._boundary_faces(tet_elems)
+                name = slicer.mrmlScene.GenerateUniqueName(f"{baseName}_surface")
+                node = self._build_model(nodes_mm, boundary, name)
+                if node:
+                    loaded_ids.append(node.GetID())
+
+            self.parent.loadedNodes = loaded_ids
+            log.info(
+                f"Loaded .msh: {len(nodes_mm)} nodes, {len(tet_elems)} tets, "
+                f"{len(loaded_ids)} model(s) ({1 if tet_elems else 0} tet mesh + "
+                f"{len(loaded_ids) - (1 if tet_elems else 0)} surface).  NPZ: {npz_path}"
+            )
+            return True
+
+        except Exception as exc:
+            import traceback
+            log.error(f"Failed to load .msh: {exc}\n{traceback.format_exc()}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _parse_msh(self, filePath):
+        """Parse Gmsh v2 .msh (ASCII or binary) and return (nodes, tri_list, tet_list).
+
+        nodes     -- (N, 3) float64 array, coordinates in mm
+        tri_list  -- list of {"tag": int, "nodes": [i, j, k]}  (0-based)
+        tet_list  -- list of {"tag": int, "nodes": [i, j, k, l]}  (0-based)
+        """
+        with open(filePath, "rb") as fh:
+            fh.readline()               # $MeshFormat
+            fmt_fields = fh.readline().split()
+            file_type  = int(fmt_fields[1])   # 0 = ASCII, 1 = binary
+
+        if file_type == 0:
+            return self._parse_msh_ascii(filePath)
+        else:
+            return self._parse_msh_binary(filePath)
+
+    def _parse_msh_ascii(self, filePath):
+        """Parse Gmsh v2 ASCII .msh."""
+        node_map = {}
+        tri_raw  = []
+        tet_raw  = []
+
+        with open(filePath, "r") as fh:
+            lines = fh.readlines()
+
+        i = 0
+        while i < len(lines):
+            section = lines[i].strip()
+            i += 1
+
+            if section == "$Nodes":
+                n_nodes = int(lines[i].strip())
+                i += 1
+                for _ in range(n_nodes):
+                    parts = lines[i].split()
+                    node_map[int(parts[0])] = (
+                        float(parts[1]), float(parts[2]), float(parts[3])
+                    )
+                    i += 1
+                i += 1  # $EndNodes
+
+            elif section == "$Elements":
+                n_elem = int(lines[i].strip())
+                i += 1
+                for _ in range(n_elem):
+                    parts  = lines[i].split()
+                    etype  = int(parts[1])
+                    n_tags = int(parts[2])
+                    tag1   = int(parts[3]) if n_tags >= 1 else 0
+                    enodes = [int(p) for p in parts[3 + n_tags:]]
+                    i += 1
+                    if etype == self._ETYPE_TRI:
+                        tri_raw.append((tag1, enodes))
+                    elif etype == self._ETYPE_TET:
+                        tet_raw.append((tag1, enodes))
+                i += 1  # $EndElements
+
+        return self._reindex(node_map, tri_raw, tet_raw)
+
+    def _parse_msh_binary(self, filePath):
+        """Parse Gmsh v2 binary .msh using numpy for efficiency."""
+        node_map = {}
+        tri_raw  = []
+        tet_raw  = []
+
+        # Gmsh v2 standard element node counts (first-order elements only)
+        NODES_PER_ETYPE = {
+            1: 2,   # line
+            2: 3,   # triangle
+            3: 4,   # quad
+            4: 4,   # tetrahedron
+            5: 8,   # hexahedron
+            6: 6,   # prism (wedge)
+            7: 5,   # pyramid
+            15: 1,  # point
+        }
+
+        with open(filePath, "rb") as fh:
+            # Skip header through $EndMeshFormat
+            fh.readline()           # $MeshFormat
+            fh.readline()           # "2.2 1 8"
+            fh.read(4)              # endian check int32
+            fh.readline()           # trailing \n
+            fh.readline()           # $EndMeshFormat
+
+            while True:
+                line = fh.readline()
+                if not line:
+                    break
+                section = line.strip().decode("latin-1")
+
+                if section == "$Nodes":
+                    n_nodes = int(fh.readline())
+                    # Each record: int32 id + 3×float64 coords = 28 bytes
+                    # Use strides to extract id and coords without copying
+                    raw      = numpy.frombuffer(fh.read(28 * n_nodes), dtype=numpy.uint8)
+                    raw      = raw.reshape(n_nodes, 28)
+                    node_ids = numpy.frombuffer(raw[:, :4].tobytes(),  dtype="<i4")
+                    coords   = numpy.frombuffer(raw[:, 4:].tobytes(),  dtype="<f8").reshape(n_nodes, 3)
+                    for k in range(n_nodes):
+                        node_map[int(node_ids[k])] = tuple(coords[k])
+                    fh.readline()   # $EndNodes
+
+                elif section == "$Elements":
+                    n_total = int(fh.readline())
+                    n_read  = 0
+                    while n_read < n_total:
+                        # Block header: elem_type, count, n_tags (3×int32)
+                        etype, count, n_tags = numpy.frombuffer(
+                            fh.read(12), dtype="<i4"
+                        )
+                        n_npe = NODES_PER_ETYPE.get(int(etype))
+                        if n_npe is None:
+                            raise ValueError(
+                                f"Unsupported Gmsh element type {int(etype)} "
+                                "in binary .msh — cannot determine record size."
+                            )
+                        # Record layout: id(1) + tags(n_tags) + nodes(n_npe) int32s
+                        rec_ints = 1 + n_tags + n_npe
+                        raw = numpy.frombuffer(
+                            fh.read(rec_ints * 4 * count), dtype="<i4"
+                        ).reshape(count, rec_ints)
+                        if int(etype) in (self._ETYPE_TRI, self._ETYPE_TET):
+                            tags  = raw[:, 1].tolist()             # tag1 column
+                            nodes = raw[:, 1 + n_tags:].tolist()   # node columns
+                            target = tri_raw if int(etype) == self._ETYPE_TRI else tet_raw
+                            for t, nn in zip(tags, nodes):
+                                target.append((t, nn))
+                        n_read += count
+                    fh.readline()   # $EndElements
+
+        return self._reindex(node_map, tri_raw, tet_raw)
+
+    def _reindex(self, node_map, tri_raw, tet_raw):
+        """Convert 1-based node_map to 0-based arrays."""
+        sorted_ids = sorted(node_map)
+        id_to_idx  = {nid: idx for idx, nid in enumerate(sorted_ids)}
+        nodes_mm   = numpy.array([node_map[nid] for nid in sorted_ids],
+                                 dtype=numpy.float64)
+        tri_list = [{"tag": t, "nodes": [id_to_idx[n] for n in nn]}
+                    for t, nn in tri_raw]
+        tet_list = [{"tag": t, "nodes": [id_to_idx[n] for n in nn]}
+                    for t, nn in tet_raw]
+        return nodes_mm, tri_list, tet_list
+
+    def _save_npz(self, npz_path, nodes_mm, tet_list):
+        """Write .npz sidecar compatible with TMSService.initialize_system().
+
+        Converts node coordinates mm -> metres (TMSWarp SI convention).
+        """
+        if not tet_list:
+            log.warning("No tetrahedral elements found; skipping .npz sidecar.")
+            return
+        elements = numpy.array([e["nodes"] for e in tet_list], dtype=numpy.int32)
+        tags     = numpy.array([e["tag"]   for e in tet_list], dtype=numpy.int32)
+        cond     = numpy.array(
+            [self._CONDUCTIVITY.get(t, self._CONDUCTIVITY[2]) for t in tags],
+            dtype=numpy.float64,
+        )
+        numpy.savez(npz_path,
+                    nodes=nodes_mm * 1e-3,   # mm -> metres
+                    elements=elements,
+                    conductivity=cond,
+                    tag1=tags)
+        log.info(f"Saved .npz sidecar: {npz_path}  "
+                 f"({len(elements):,} tets, {len(numpy.unique(tags))} tissue tags)")
+
+    def _build_tet_model(self, nodes_mm, tet_list, name):
+        """Create a vtkMRMLModelNode backed by vtkUnstructuredGrid from tet elements.
+
+        Cell data arrays added:
+          - Tag          (int)   : Gmsh tissue tag
+          - Conductivity (float) : tissue conductivity in S/m
+        """
+        import vtk
+        if not tet_list:
+            return None
+
+        pts = vtk.vtkPoints()
+        pts.SetDataTypeToDouble()
+        for xyz in nodes_mm:
+            pts.InsertNextPoint(float(xyz[0]), float(xyz[1]), float(xyz[2]))
+
+        grid = vtk.vtkUnstructuredGrid()
+        grid.SetPoints(pts)
+        grid.Allocate(len(tet_list))
+        for tet in tet_list:
+            ids = vtk.vtkIdList()
+            for idx in tet["nodes"]:
+                ids.InsertNextId(idx)
+            grid.InsertNextCell(vtk.VTK_TETRA, ids)
+
+        tagArray = vtk.vtkIntArray()
+        tagArray.SetName("Tag")
+        tagArray.SetNumberOfValues(len(tet_list))
+
+        condArray = vtk.vtkFloatArray()
+        condArray.SetName("Conductivity")
+        condArray.SetNumberOfValues(len(tet_list))
+
+        for i, tet in enumerate(tet_list):
+            tag = tet["tag"]
+            tagArray.SetValue(i, tag)
+            condArray.SetValue(i, self._CONDUCTIVITY.get(tag, self._CONDUCTIVITY[2]))
+
+        grid.GetCellData().AddArray(tagArray)
+        grid.GetCellData().AddArray(condArray)
+        grid.GetCellData().SetActiveScalars("Conductivity")
+
+        node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", name)
+        node.SetAndObserveMesh(grid)
+        node.CreateDefaultDisplayNodes()
+        node.GetDisplayNode().SetScalarVisibility(True)
+        node.GetDisplayNode().SetActiveScalar("Conductivity", vtk.vtkAssignAttribute.CELL_DATA)
+        return node
+
+    def _build_model(self, nodes_mm, tri_list, name):
+        """Create a vtkMRMLModelNode from a list of triangle node-index triples."""
+        import vtk
+        if not tri_list:
+            return None
+
+        pts = vtk.vtkPoints()
+        for xyz in nodes_mm:
+            pts.InsertNextPoint(float(xyz[0]), float(xyz[1]), float(xyz[2]))
+
+        cells = vtk.vtkCellArray()
+        for tri in tri_list:
+            cells.InsertNextCell(3)
+            for idx in tri:
+                cells.InsertCellPoint(idx)
+
+        poly = vtk.vtkPolyData()
+        poly.SetPoints(pts)
+        poly.SetPolys(cells)
+
+        node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", name)
+        node.SetAndObservePolyData(poly)
+        node.CreateDefaultDisplayNodes()
+        return node
+
+    def _boundary_faces(self, tet_list):
+        """Return triangles on the boundary of a tet mesh (faces shared by 1 tet only)."""
+        face_count = {}
+        for tet in tet_list:
+            n = tet["nodes"]
+            for face in (
+                (n[0], n[1], n[2]),
+                (n[0], n[1], n[3]),
+                (n[0], n[2], n[3]),
+                (n[1], n[2], n[3]),
+            ):
+                key = tuple(sorted(face))
+                face_count[key] = face_count.get(key, 0) + 1
+
+        return [list(k) for k, v in face_count.items() if v == 1]
+
+
+# ============================================================
 # Self-test
 # ============================================================
 
