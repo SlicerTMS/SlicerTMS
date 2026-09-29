@@ -49,6 +49,9 @@ if os.path.isdir(_TMSWARP_SRC) and _TMSWARP_SRC not in sys.path:
 
 DEFAULT_PORT = 18892
 DIDT = 1e6  # A/s — standard TMS pulse
+OPT_RTOL = 1e-3  # relative CG residual for solves during optimization
+OPT_LR = 2.0     # initial Adam step size (mm)
+OPT_LR_DECAY = 0.92  # step size multiplier per iteration
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +85,8 @@ class TMSService(rpyc.SlaveService):
         self._last_probe_mat = None  # last 4x4 probe matrix (for optimization init)
         self._surf_centers = None    # (F, 3) boundary face centers (meters)
         self._surf_normals = None    # (F, 3) outward face normals
+        self._surf_verts = None      # (F, 3, 3) boundary face vertices (meters)
+        self._surf_vnormals = None   # (F, 3, 3) vertex normals per face corner
         self._surf_tree = None       # cKDTree for nearest-surface queries
         self._numpy_prep_thread = None  # background thread for G/K assembly
         self._numpy_prep_error = None   # exception from background thread
@@ -528,28 +533,85 @@ class TMSService(rpyc.SlaveService):
         norms = np.linalg.norm(normals, axis=1, keepdims=True)
         normals /= np.maximum(norms, 1e-12)
 
-        # Orient outward (away from mesh centroid)
-        mesh_ctr = nodes.mean(axis=0)
-        flip = np.sum(normals * (centers - mesh_ctr), axis=1) < 0
+        # Orient outward (away from the tetrahedron that owns the face)
+        owner = np.nonzero(bnd_mask)[0] // 4
+        tet_ctr = nodes[elems[owner]].mean(axis=1)
+        flip = np.sum(normals * (centers - tet_ctr), axis=1) < 0
         normals[flip] *= -1
+
+        # Per-vertex normals, for a normal that varies smoothly over the surface
+        from tmswarp.surface import vertex_normals
+        vnormals = vertex_normals(
+            len(nodes), bnd_faces, normals, 0.5 * norms[:, 0]
+        )
 
         self._surf_centers = centers
         self._surf_normals = normals
+        self._surf_verts = np.stack([v0, v1, v2], axis=1)   # (F, 3, 3)
+        self._surf_vnormals = vnormals[bnd_faces]           # (F, 3, 3)
         self._surf_tree = cKDTree(centers)
         print(f"  {len(bnd_faces)} boundary faces extracted.")
         sys.stdout.flush()
 
-    def _project_to_surface(self, pos_m, offset_m=0.01):
-        """Project a point to the nearest surface face + offset along normal.
+    def _project_to_surface(self, pos_m, offset_m=0.01, n_candidates=24):
+        """Project a point to the closest point on the surface + offset.
+
+        The closest point is found on the triangles themselves (not only
+        their centers), and the normal is interpolated from the vertex
+        normals, so the result moves continuously with ``pos_m``.
 
         Returns (projected_position_m, outward_normal).
         """
+        from tmswarp.surface import closest_point_on_triangles
+
         if self._surf_tree is None:
             self._build_surface_data()
-        _, idx = self._surf_tree.query(pos_m)
-        sp = self._surf_centers[idx]
-        sn = self._surf_normals[idx]
-        return sp + offset_m * sn, sn
+        k = min(n_candidates, len(self._surf_centers))
+        _, idx = self._surf_tree.query(pos_m, k=k)
+        idx = np.atleast_1d(idx)
+        tri = self._surf_verts[idx]
+        points, bary = closest_point_on_triangles(
+            pos_m, tri[:, 0], tri[:, 1], tri[:, 2]
+        )
+        j = int(np.argmin(np.linalg.norm(points - pos_m, axis=1)))
+        sn = bary[j] @ self._surf_vnormals[idx[j]]
+        length = np.linalg.norm(sn)
+        if length < 1e-12:
+            sn = self._surf_normals[idx[j]]
+        else:
+            sn = sn / length
+        return points[j] + offset_m * sn, sn
+
+    def _surface_gradient(self, pos_m, normal, grad_pos_m, grad_moment,
+                          offset_m, h=1e-3):
+        """Gradient of the loss with respect to motion along the surface.
+
+        The coil sits at the surface + offset with its moment along the
+        surface normal, so moving it changes both position and moment.
+        The derivatives of that (cheap, purely geometric) mapping are taken
+        by central differences of ``_project_to_surface`` and combined by
+        the chain rule with the loss gradients with respect to position
+        and moment.
+
+        Returns a vector in the tangent plane (per metre).
+        """
+        ref = np.array([0.0, 0.0, 1.0])
+        if abs(np.dot(normal, ref)) > 0.9:
+            ref = np.array([1.0, 0.0, 0.0])
+        t1 = np.cross(normal, ref)
+        t1 /= np.linalg.norm(t1)
+        t2 = np.cross(normal, t1)
+
+        gradient = np.zeros(3)
+        for t in (t1, t2):
+            p_plus, n_plus = self._project_to_surface(pos_m + h * t, offset_m)
+            p_minus, n_minus = self._project_to_surface(pos_m - h * t, offset_m)
+            slope = (
+                np.dot(grad_pos_m, p_plus - p_minus)
+                + np.dot(grad_moment, n_plus - n_minus)
+            ) / (2.0 * h)
+            gradient += slope * t
+        return gradient
 
     def _find_nearest_element(self, target_m):
         """Find the brain element nearest to a target point (in meters).
@@ -721,13 +783,9 @@ class TMSService(rpyc.SlaveService):
         mat[:3, 3] = pos_mm
         return mat
 
-    def _warp_solve_to_convergence(self, dAdt, max_chunks=20):
-        """Run the warp GPU solver to convergence, return Enorm array."""
-        self._warp_ctx.set_rhs(dAdt)
-        for _ in range(max_chunks):
-            err, iters, converged = self._warp_ctx.step(n_iters=50)
-            if converged:
-                break
+    def _warp_solve_to_convergence(self, dAdt, max_iters=1000):
+        """Run the warp solver to a relative residual, return Enorm array."""
+        self._warp_ctx.solve(dAdt, rtol=OPT_RTOL, max_iters=max_iters)
         return self._warp_ctx.compute_enorm()
 
     def _generate_seed_positions(self, target_m, n_seeds=20):
@@ -763,10 +821,12 @@ class TMSService(rpyc.SlaveService):
           1. **Multi-start seeding** — evaluate diverse scalp positions near the
              target and pick the best starting point.
           2. **Adam refinement** — gradient-based optimization from the best seed,
-             with finite-difference gradients (warp GPU) or adjoint (numpy).
+             with gradients from Warp autodiff (wp.Tape with an adjoint
+             linear solve) or a hand-derived adjoint (numpy).
 
         The coil is constrained to stay on the scalp surface + 10 mm offset.
         Moment direction is set to the outward surface normal at each step.
+        The best position found is the one returned.
 
         If a new OPTIMIZE or PROBE command arrives on stdin the method returns
         it immediately so the caller can dispatch it.  ``_last_probe_mat`` is
@@ -822,9 +882,11 @@ class TMSService(rpyc.SlaveService):
                 if cmd is not None:
                     return cmd
 
-                seed_m = (self._surf_centers[fidx]
-                          + offset_m * self._surf_normals[fidx])
-                norm = self._surf_normals[fidx]
+                seed_m, norm = self._project_to_surface(
+                    self._surf_centers[fidx]
+                    + offset_m * self._surf_normals[fidx],
+                    offset_m,
+                )
 
                 dAdt = magnetic_dipole_dadt(seed_m, norm, DIDT, nodes)
                 Enorm = self._warp_solve_to_convergence(dAdt)
@@ -885,14 +947,16 @@ class TMSService(rpyc.SlaveService):
         # ==============================================================
         # Phase 2: Adam gradient refinement
         # ==============================================================
-        lr = 2.0
+        lr = OPT_LR
         beta1, beta2, eps_adam = 0.9, 0.999, 1e-8
         m_adam = np.zeros(3)
         v_adam = np.zeros(3)
 
         max_iters = 60
-        fd_eps = 1.0  # mm
         best_loss = float('inf')
+        best_pos_m = None       # position and normal that gave best_loss
+        best_normal = None
+        stall_ref = float('inf')
         stall_count = 0
 
         for iteration in range(max_iters):
@@ -908,31 +972,27 @@ class TMSService(rpyc.SlaveService):
             moment_dir = normal
 
             if use_warp:
-                # --- Warp GPU: finite-difference gradient ---
-                dAdt = magnetic_dipole_dadt(
-                    pos_mm * 1e-3, moment_dir, DIDT, nodes
-                )
-                Enorm = self._warp_solve_to_convergence(dAdt)
-                loss = -float(Enorm[target_elem])
-
-                grad = np.zeros(3)
-                for i in range(3):
-                    pos_pert_m = (pos_mm * 1e-3).copy()
-                    pos_pert_m[i] += fd_eps * 1e-3
-                    dAdt_pert = magnetic_dipole_dadt(
-                        pos_pert_m, moment_dir, DIDT, nodes
+                # --- Warp: autodiff gradient (wp.Tape + adjoint solve) ---
+                loss, grad_pos_m, grad_moment = (
+                    self._warp_ctx.objective_and_gradient(
+                        pos_mm * 1e-3, moment_dir, target_elem,
+                        didt=DIDT, rtol=OPT_RTOL,
                     )
-                    Enorm_pert = self._warp_solve_to_convergence(dAdt_pert)
-                    loss_pert = -float(Enorm_pert[target_elem])
-                    grad[i] = (loss_pert - loss) / fd_eps
+                )
             else:
                 # --- Numpy CG adjoint ---
                 params = np.concatenate([pos_mm, normal])
                 loss, grad_full = self._compute_objective_and_gradient(
                     params, target_elem
                 )
-                grad = grad_full[:3]
+                grad_pos_m = grad_full[:3] * 1e3  # per mm -> per metre
+                grad_moment = grad_full[3:6]
                 Enorm = None
+
+            # Gradient along the surface, per mm
+            grad = 1e-3 * self._surface_gradient(
+                proj_pos_m, normal, grad_pos_m, grad_moment, offset_m
+            )
 
             # Adam update (position only)
             t_adam = iteration + 1
@@ -941,10 +1001,17 @@ class TMSService(rpyc.SlaveService):
             m_hat = m_adam / (1 - beta1 ** t_adam)
             v_hat = v_adam / (1 - beta2 ** t_adam)
             pos_mm = pos_mm - lr * m_hat / (np.sqrt(v_hat) + eps_adam)
+            lr *= OPT_LR_DECAY
 
-            # Track improvement
-            if loss < best_loss - 0.1:
+            # Track the best position seen; it is what gets returned
+            if loss < best_loss:
                 best_loss = loss
+                best_pos_m = proj_pos_m.copy()
+                best_normal = normal.copy()
+
+            # Stall detection: no improvement of more than 0.1 V/m
+            if loss < stall_ref - 0.1:
+                stall_ref = loss
                 stall_count = 0
             else:
                 stall_count += 1
@@ -957,7 +1024,7 @@ class TMSService(rpyc.SlaveService):
             if emit_viz:
                 if use_warp:
                     if self._sharedEnorm is not None:
-                        self._sharedEnorm[:] = Enorm
+                        self._sharedEnorm[:] = self._warp_ctx.compute_enorm()
                 else:
                     from tmswarp.solver import assemble_rhs_tms
                     from tmswarp.fields import compute_efield_at_elements
@@ -1000,14 +1067,20 @@ class TMSService(rpyc.SlaveService):
                 break
 
         # ==============================================================
-        # Final solve & emit
+        # Final solve & emit, at the best position found
         # ==============================================================
-        proj_pos_m, normal = self._project_to_surface(pos_mm * 1e-3, offset_m)
+        if best_pos_m is not None:
+            proj_pos_m, normal = best_pos_m, best_normal
+        else:
+            proj_pos_m, normal = self._project_to_surface(
+                pos_mm * 1e-3, offset_m
+            )
         dAdt = magnetic_dipole_dadt(proj_pos_m, normal, DIDT, nodes)
         if use_warp:
             Enorm = self._warp_solve_to_convergence(dAdt)
             if self._sharedEnorm is not None:
                 self._sharedEnorm[:] = Enorm
+            final_enorm = float(Enorm[target_elem])
         else:
             from tmswarp.solver import assemble_rhs_tms
             from tmswarp.fields import compute_efield_at_elements
@@ -1017,6 +1090,7 @@ class TMSService(rpyc.SlaveService):
             self.E = compute_efield_at_elements(self.mesh, phi, dAdt, self._G)
             if self._sharedEnorm is not None:
                 self._sharedEnorm[:] = np.linalg.norm(self.E, axis=1)
+            final_enorm = float(np.linalg.norm(self.E[target_elem]))
         self._dAdt = dAdt
 
         p4m = np.concatenate([proj_pos_m * 1e3, normal])
@@ -1025,10 +1099,10 @@ class TMSService(rpyc.SlaveService):
         vals = " ".join(f"{v:.6f}" for v in mat.ravel())
         print(f"OPT_PROBE {vals}")
         print(
-            f"OPTIMIZE_STATUS Done — |E|={-best_loss:.2f} V/m"
+            f"OPTIMIZE_STATUS Done — |E|={final_enorm:.2f} V/m"
             f" after seeding + {iteration+1} iters"
         )
-        print(f"OPTIMIZE_DONE iter={iteration} loss={best_loss:.6e}")
+        print(f"OPTIMIZE_DONE iter={iteration} loss={-final_enorm:.6e}")
         sys.stdout.flush()
         return None
 
@@ -1136,7 +1210,13 @@ if __name__ == "__main__":
         "--solver", default="numpy", choices=TMSService.SOLVERS,
         help="Default solver backend (default: numpy)"
     )
+    parser.add_argument(
+        "--opt-rtol", type=float, default=OPT_RTOL,
+        help="Relative CG residual for solves during optimization "
+             f"(default {OPT_RTOL:g})"
+    )
     args = parser.parse_args()
+    OPT_RTOL = args.opt_rtol
 
     print(
         f"Starting TMSService on port {args.port} "
